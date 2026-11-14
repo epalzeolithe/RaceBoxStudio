@@ -11,6 +11,7 @@
     ],
   },
   "files": [
+    { "path": "RaceBoxWatch-Watch-App-Info.plist" },
     { "kind": "folder", "path": "RaceBoxStudio", "target-membership": [ "RaceBoxStudio" ] },
     { "kind": "folder", "path": "RaceBoxWatch Watch App", "target-membership": [ "RaceBoxWatch Watch App" ] },
     {
@@ -35,6 +36,8 @@
         "resources",
       ],
       "build-settings": {
+        "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
+        "ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS": "YES",
         "CODE_SIGN_STYLE": "Automatic",
         "CURRENT_PROJECT_VERSION": "1",
         "DEVELOPMENT_TEAM": "JY24347UPR",
@@ -90,6 +93,7 @@
       "build-settings": {
         "CODE_SIGN_STYLE": "Automatic",
         "CURRENT_PROJECT_VERSION": "1",
+        "DEVELOPMENT_TEAM": "JY24347UPR",
         "INFOPLIST_KEY_CFBundleDisplayName": "RaceBoxWatch",
         "MARKETING_VERSION": "1.0",
         "PRODUCT_BUNDLE_IDENTIFIER": "com.yourcompany.RaceBoxWatch",
@@ -113,12 +117,17 @@
       "build-settings": {
         "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
         "ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME": "AccentColor",
+        "CODE_SIGN_ENTITLEMENTS": "RaceBoxWatch Watch App/RaceBoxWatch Watch App.entitlements",
         "CODE_SIGN_STYLE": "Automatic",
         "CURRENT_PROJECT_VERSION": "1",
+        "DEVELOPMENT_TEAM": "JY24347UPR",
         "ENABLE_PREVIEWS": "YES",
         "GENERATE_INFOPLIST_FILE": "YES",
+        "INFOPLIST_FILE": "RaceBoxWatch-Watch-App-Info.plist",
         "INFOPLIST_KEY_CFBundleDisplayName": "RaceBoxWatch",
         "INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription": "RaceBoxStudio se connecte en Bluetooth à votre RaceBox pour démarrer et arrêter l'enregistrement.",
+        "INFOPLIST_KEY_NSHealthShareUsageDescription": "RaceBoxWatch lit ta fréquence cardiaque pendant la séance de vol.",
+        "INFOPLIST_KEY_NSHealthUpdateUsageDescription": "RaceBoxWatch enregistre une séance d'entraînement pendant l'enregistrement RaceBox, pour rester active poignet baissé et utiliser le bouton Action.",
         "INFOPLIST_KEY_UISupportedInterfaceOrientations": "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown",
         "INFOPLIST_KEY_WKWatchOnly": "YES",
         "LD_RUNPATH_SEARCH_PATHS": [

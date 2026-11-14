@@ -24,8 +24,19 @@ enum UBX {
         static let liveData: UInt8 = 0x01
         static let ack: UInt8 = 0x02
         static let nack: UInt8 = 0x03
+        /// Donnée enregistrée en mémoire : même charge utile de 80 octets que `liveData`.
+        static let recordedData: UInt8 = 0x21
+        static let recordingStatus: UInt8 = 0x22
+        /// Démarre le téléchargement (charge vide) ou l'annule (un octet).
+        static let download: UInt8 = 0x23
+        /// Effacement de la mémoire (charge vide) ou annulation (un octet). Progression : un octet 0…100.
+        static let erase: UInt8 = 0x24
         static let recordingConfig: UInt8 = 0x25
+        /// Changement d'état de l'enregistrement autonome (démarrage, arrêt, pause).
+        static let recordingStateChange: UInt8 = 0x26
         static let gnssConfig: UInt8 = 0x27
+        /// Déverrouillage de la mémoire avec le code de sécurité (UInt32).
+        static let unlock: UInt8 = 0x30
     }
 
     /// UBX-MON-VER : lecture seule, transmise telle quelle à la puce GNSS.
@@ -132,11 +143,141 @@ struct GNSSConfig: Equatable {
 
 // MARK: - Enregistrement autonome (0xFF 0x25, Mini S / Micro)
 
-enum RecordingConfig {
+struct RecordingSettings: Equatable {
+    enum DataRate: UInt8, CaseIterable, Identifiable {
+        case hz25 = 0, hz10 = 1, hz5 = 2, hz1 = 3, hz20 = 4
+
+        var id: UInt8 { rawValue }
+        var hertz: Int {
+            switch self {
+            case .hz25: 25
+            case .hz20: 20
+            case .hz10: 10
+            case .hz5: 5
+            case .hz1: 1
+            }
+        }
+        /// 20 Hz demande le firmware 3.3 ou plus.
+        var needsFirmware33: Bool { self == .hz20 }
+
+        static let ordered: [DataRate] = [.hz25, .hz20, .hz10, .hz5, .hz1]
+    }
+
+    var dataRate: DataRate = .hz25
+    var waitForFix = true
+    var stationaryFilter = false
+    var noFixFilter = false
+    var autoShutdown = false
+    var waitForDataBeforeShutdown = false
+    /// Seuil du filtre d'arrêt, en mm/s (1389 ≈ 5 km/h).
+    var stationarySpeed: UInt16 = 1389
+    /// Durées de détection, en secondes.
+    var stationaryInterval: UInt16 = 30
+    var noFixInterval: UInt16 = 30
+    var shutdownInterval: UInt16 = 300
+
     /// 25 Hz, attend un fix avant de démarrer, AUCUN filtre d'arrêt :
     /// le filtre No-Fix couperait l'enregistrement pendant un vol dos prolongé.
-    static let start: [UInt8] = [1, 0, 0x01, 0] + [UInt8](repeating: 0, count: 8)
-    static let stop = [UInt8](repeating: 0, count: 12)
+    static let aerobatics = RecordingSettings()
+
+    /// Réglage conseillé par RaceBox : tous les filtres, 5 km/h pendant 30 s, arrêt auto après 5 min.
+    static let recommended = RecordingSettings(stationaryFilter: true, noFixFilter: true,
+                                               autoShutdown: true, waitForDataBeforeShutdown: true)
+
+    static let disablePayload = [UInt8](repeating: 0, count: 12)
+
+    init(dataRate: DataRate = .hz25, waitForFix: Bool = true, stationaryFilter: Bool = false,
+         noFixFilter: Bool = false, autoShutdown: Bool = false, waitForDataBeforeShutdown: Bool = false) {
+        self.dataRate = dataRate
+        self.waitForFix = waitForFix
+        self.stationaryFilter = stationaryFilter
+        self.noFixFilter = noFixFilter
+        self.autoShutdown = autoShutdown
+        self.waitForDataBeforeShutdown = waitForDataBeforeShutdown
+    }
+
+    /// Décode le débit, les drapeaux et les quatre UInt16 placés à partir de l'octet 4.
+    private init?(rate: UInt8, flags: UInt8, tail: ArraySlice<UInt8>) {
+        guard tail.count >= 8, let rate = DataRate(rawValue: rate) else { return nil }
+        let values = Array(tail)
+        func u16(_ offset: Int) -> UInt16 { UInt16(values[offset]) | UInt16(values[offset + 1]) << 8 }
+        dataRate = rate
+        waitForFix = flags & 0x01 != 0
+        stationaryFilter = flags & 0x02 != 0
+        noFixFilter = flags & 0x04 != 0
+        autoShutdown = flags & 0x08 != 0
+        waitForDataBeforeShutdown = flags & 0x10 != 0
+        stationarySpeed = u16(0)
+        stationaryInterval = u16(2)
+        noFixInterval = u16(4)
+        shutdownInterval = u16(6)
+    }
+
+    /// Réponse à la lecture 0xFF 0x25 : [activé, débit, drapeaux, réservé, 4 × UInt16].
+    static func fromConfigPayload(_ payload: [UInt8]) -> (enabled: Bool, settings: RecordingSettings)? {
+        guard payload.count == 12,
+              let settings = RecordingSettings(rate: payload[1], flags: payload[2], tail: payload[4...]) else { return nil }
+        return (payload[0] != 0, settings)
+    }
+
+    var flags: UInt8 {
+        (waitForFix ? 0x01 : 0) | (stationaryFilter ? 0x02 : 0) | (noFixFilter ? 0x04 : 0)
+            | (autoShutdown ? 0x08 : 0) | (waitForDataBeforeShutdown ? 0x10 : 0)
+    }
+
+    var enablePayload: [UInt8] {
+        var out: [UInt8] = [1, dataRate.rawValue, flags, 0]
+        for value in [stationarySpeed, stationaryInterval, noFixInterval, shutdownInterval] {
+            out += [UInt8(value & 0xFF), UInt8(value >> 8)]
+        }
+        return out
+    }
+
+    var summary: String {
+        var parts = ["\(dataRate.hertz) Hz"]
+        if waitForFix { parts.append("attente fix") }
+        if stationaryFilter {
+            parts.append("arrêt < \(Int((Double(stationarySpeed) * 0.0036).rounded())) km/h (\(stationaryInterval) s)")
+        }
+        if noFixFilter { parts.append("no-fix \(noFixInterval) s") }
+        if autoShutdown { parts.append("extinction \(shutdownInterval) s") }
+        return parts.joined(separator: " · ")
+    }
+}
+
+/// Message 0xFF 0x26 : nouvel état de l'enregistrement autonome.
+enum RecordingStateChange: UInt8 {
+    case stopped = 0, running = 1, paused = 2
+
+    init?(payload: [UInt8]) {
+        guard let first = payload.first else { return nil }
+        self.init(rawValue: first)
+    }
+
+    var label: String {
+        switch self {
+        case .stopped: "arrêté"
+        case .running: "en cours"
+        case .paused: "en pause (filtre)"
+        }
+    }
+}
+
+// MARK: - Alimentation (octet 67 du message de données)
+
+enum PowerReading: Equatable {
+    /// Mini / Mini S : bit de poids fort = en charge, 7 bits restants = niveau en %.
+    case battery(percent: Int, charging: Bool)
+    /// Micro : pas de batterie, tension d'entrée (octet / 10).
+    case inputVoltage(Double)
+
+    init(byte: UInt8, isMicro: Bool) {
+        if isMicro {
+            self = .inputVoltage(Double(byte) / 10)
+        } else {
+            self = .battery(percent: Int(byte & 0x7F), charging: byte & 0x80 != 0)
+        }
+    }
 }
 
 // MARK: - Réponse UBX-MON-VER

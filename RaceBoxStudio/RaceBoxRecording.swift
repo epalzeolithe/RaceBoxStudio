@@ -25,6 +25,11 @@ struct RecordingStatus: Equatable {
 
     var isLocked: Bool { securityEnabled && !unlocked }
 
+    /// Durée d'enregistrement restante dans la mémoire libre à la fréquence donnée (sans pause de filtre).
+    func remainingTime(hertz: Int) -> TimeInterval {
+        Double(max(memorySize - storedMessages, 0)) / Double(max(hertz, 1))
+    }
+
     init?(payload: [UInt8]) {
         guard payload.count >= 12 else { return nil }
         isRecording = payload[0] != 0
@@ -57,6 +62,8 @@ struct RaceBoxSample {
     let headingAccuracy: Double
     let pdop: Double
     let latLonFlags: UInt8
+    /// Batterie (Mini / Mini S) ou tension d'entrée (Micro), voir `PowerReading`.
+    let powerByte: UInt8
     let gForceX: Double
     let gForceY: Double
     let gForceZ: Double
@@ -65,6 +72,9 @@ struct RaceBoxSample {
     let rotationZ: Double
 
     var hasValidPosition: Bool { fixStatus >= 2 && latLonFlags & 0x01 == 0 }
+    /// Recommandation de la doc : fix 3D avec le bit « fix valide » levé.
+    var hasGoodFix: Bool { fixStatus == 3 && fixFlags & 0x01 != 0 }
+    var totalG: Double { (gForceX * gForceX + gForceY * gForceY + gForceZ * gForceZ).squareRoot() }
 
     private static let utc: Calendar = {
         var calendar = Calendar(identifier: .gregorian)
@@ -97,6 +107,7 @@ struct RaceBoxSample {
         headingAccuracy = Double(p.u32(60)) / 1e5
         pdop = Double(p.u16(64)) / 100
         latLonFlags = p[66]
+        powerByte = p[67]
         gForceX = Double(p.i16(68)) / 1000
         gForceY = Double(p.i16(70)) / 1000
         gForceZ = Double(p.i16(72)) / 1000
@@ -116,13 +127,17 @@ struct RecordingSession: Identifiable {
     /// Écart maximal entre deux échantillons d'une même session, en ms (25 Hz = 40 ms).
     private static let maxGap: Int64 = 5000
 
-    static func split(_ samples: [RaceBoxSample]) -> [RecordingSession] {
+    /// `boundaries` : indices des échantillons qui suivent un message 0xFF 0x26 de démarrage ou d'arrêt.
+    /// S'il y en a, ils font foi (une pause de filtre reste dans la même session) ;
+    /// sinon (ancien firmware) on coupe sur les sauts de temps GPS.
+    static func split(_ samples: [RaceBoxSample], boundaries: Set<Int> = []) -> [RecordingSession] {
         var sessions: [RecordingSession] = []
         var current: [RaceBoxSample] = []
-        for sample in samples {
+        for (index, sample) in samples.enumerated() {
             if let last = current.last {
                 let delta = Int64(sample.itow) - Int64(last.itow)
-                if delta < 0 || delta > maxGap {
+                let cut = boundaries.isEmpty ? (delta < 0 || delta > maxGap) : boundaries.contains(index)
+                if cut {
                     sessions.append(RecordingSession(samples: current))
                     current = []
                 }
@@ -139,6 +154,7 @@ struct RecordingSession: Identifiable {
         return Double(Int64(last.itow) - Int64(first.itow)) / 1000
     }
     var maxSpeedKmh: Double { (samples.map(\.speed).max() ?? 0) * 3.6 }
+    var maxG: Double { samples.map(\.totalG).max() ?? 0 }
 
     var title: String {
         guard let startDate else { return "Session sans date" }

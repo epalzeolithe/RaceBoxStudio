@@ -1,6 +1,9 @@
 import CoreBluetooth
 import Foundation
 import Observation
+#if os(macOS)
+import AppKit
+#endif
 
 struct LogEntry: Identifiable {
     let id = UUID()
@@ -12,23 +15,32 @@ enum LinkError: LocalizedError {
     case bluetoothUnavailable
     case notConnected
     case missingCharacteristic(String)
-    case timeout
+    /// Délai de connexion dépassé ; indique l'étape où le boîtier ne répondait plus.
+    case timeout(String)
     case disconnected
     case noResponse
     case rejected(String)
     case firmwareTooOld(String)
+    case memoryLocked
+    case downloadStalled
+    case unlockFailed
 
     var errorDescription: String? {
         switch self {
+        case .memoryLocked: "La mémoire du boîtier est verrouillée par un code de sécurité."
+        case .downloadStalled: "Le téléchargement s'est arrêté : plus de données reçues."
+        case .unlockFailed: "Code refusé. Attention : plusieurs essais ratés peuvent bloquer le boîtier."
         case .bluetoothUnavailable: "Le Bluetooth n'est pas disponible ou n'est pas autorisé."
         case .notConnected: "Aucun boîtier connecté."
         case .missingCharacteristic(let uuid): "Caractéristique BLE introuvable : \(uuid)."
-        case .timeout: "Délai dépassé."
+        case .timeout(let step):
+            "Délai dépassé pendant : \(step). Si la LED est bleue fixe, le boîtier est peut-être déjà connecté "
+                + "à un autre appareil (app RaceBox, montre…) : ferme-le, ou éteins/rallume le RaceBox."
         case .disconnected: "Le boîtier s'est déconnecté."
         case .noResponse: "Pas de réponse du boîtier."
         case .rejected(let detail): "Le boîtier a refusé la commande (NACK). \(detail)"
         case .firmwareTooOld(let version):
-            "La configuration GNSS demande le firmware 3.3 ou plus (boîtier : \(version)). Mets-le à jour avec l'app RaceBox."
+            "Cette fonction demande le firmware 3.3 ou plus (boîtier : \(version)). Mets-le à jour avec l'app RaceBox."
         }
     }
 }
@@ -43,6 +55,8 @@ final class RaceBoxLink: NSObject {
         var rssi: Int
         /// Nom "RaceBox…" ou service UART Nordic annoncé.
         var isRaceBox: Bool
+        /// Toujours connecté au système (app relancée sans déconnexion) : il n'émet plus d'annonce.
+        var alreadyConnected = false
     }
 
     enum State: Equatable {
@@ -60,16 +74,57 @@ final class RaceBoxLink: NSObject {
     private(set) var deviceName: String?
     private(set) var modelNumber: String?
     private(set) var firmware: String?
+    private(set) var serialNumber: String?
+    private(set) var hardwareRevision: String?
+    /// Dernier message de données temps réel (rafraîchi 4 fois par seconde au plus).
+    private(set) var liveSample: RaceBoxSample?
+    /// Fréquence mesurée du flux temps réel, en Hz.
+    private(set) var liveRate: Double = 0
+    private(set) var power: PowerReading?
+    /// Autonomie batterie estimée d'après la vitesse de décharge observée, en secondes.
+    private(set) var batteryTimeRemaining: TimeInterval?
+    private(set) var recordingSettings: RecordingSettings?
+    /// Dernier changement d'état reçu en direct (0xFF 0x26) : permet de distinguer la pause d'un filtre.
+    private(set) var recordingState: RecordingStateChange?
+    /// Progression de l'effacement (0…100), nil hors effacement.
+    private(set) var eraseProgress: Int?
     private(set) var gnssConfig: GNSSConfig?
     private(set) var chipInfo: ChipInfo?
     private(set) var isBusy = false
+    private(set) var recordingStatus: RecordingStatus?
+    private(set) var isDownloading = false
+    /// Nombre d'échantillons reçus pendant le téléchargement (mis à jour par paliers).
+    private(set) var downloadedCount = 0
+    /// Nombre de messages annoncé par le boîtier au début du téléchargement.
+    private(set) var downloadExpected = 0
+    private(set) var sessions: [RecordingSession] = []
     private(set) var log: [LogEntry] = []
     var errorMessage: String?
     /// Affiche tous les appareils BLE alentour, pas seulement les RaceBox (aide au diagnostic).
-    var showAllDevices = false
+    var showAllDevices = true
+
+    // MARK: Réglages (conservés entre deux lancements)
+
+    /// Se connecte tout seul au premier RaceBox trouvé pendant une recherche.
+    var autoConnect = UserDefaults.standard.bool(forKey: "autoConnect") {
+        didSet { UserDefaults.standard.set(autoConnect, forKey: "autoConnect") }
+    }
+    /// Libère le boîtier quand on quitte l'app (macOS) ou qu'elle passe en arrière-plan (iOS).
+    var disconnectOnQuit = UserDefaults.standard.object(forKey: "disconnectOnQuit") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(disconnectOnQuit, forKey: "disconnectOnQuit") }
+    }
+
+    var isMicro: Bool { modelNumber?.localizedCaseInsensitiveContains("Micro") == true }
+    /// Seuls les Mini S et Micro savent enregistrer en autonome.
+    var supportsRecording: Bool {
+        guard let modelNumber else { return false }
+        return isMicro || modelNumber.localizedCaseInsensitiveContains("Mini S")
+    }
 
     var visibleDevices: [Device] {
-        (showAllDevices ? devices : devices.filter(\.isRaceBox)).sorted { $0.rssi > $1.rssi }
+        (showAllDevices ? devices : devices.filter(\.isRaceBox)).sorted {
+            $0.alreadyConnected != $1.alreadyConnected ? $0.alreadyConnected : $0.rssi > $1.rssi
+        }
     }
 
     // MARK: Interne
@@ -79,6 +134,8 @@ final class RaceBoxLink: NSObject {
     private static let uartTX = CBUUID(string: "6E400003-B5A3-F393-E0A9-E50E24DCCA9E") // notifications du boîtier
     private static let modelUUID = CBUUID(string: "2A24")
     private static let firmwareUUID = CBUUID(string: "2A26")
+    private static let serialUUID = CBUUID(string: "2A25")
+    private static let hardwareUUID = CBUUID(string: "2A27")
     private static let writeChunkSize = 20 // MTU faible : la doc autorise le découpage
 
     private struct Waiter {
@@ -98,17 +155,44 @@ final class RaceBoxLink: NSObject {
     @ObservationIgnored private var scanTask: Task<Void, Never>?
     @ObservationIgnored private var wantsScan = false
     @ObservationIgnored private var pendingServiceDiscoveries = 0
+    @ObservationIgnored private var downloadBuffer: [RaceBoxSample] = []
+    @ObservationIgnored private var lastDownloadActivity = Date()
+    /// Indices de `downloadBuffer` où un message 0xFF 0x26 (démarrage / arrêt) a été reçu.
+    @ObservationIgnored private var downloadBoundaries: Set<Int> = []
+    @ObservationIgnored private var lastLivePublish = Date.distantPast
+    @ObservationIgnored private var liveWindowStart = Date()
+    @ObservationIgnored private var liveWindowCount = 0
+    /// Changements de niveau de batterie observés hors charge (date, %).
+    @ObservationIgnored private var batteryHistory: [(date: Date, percent: Int)] = []
+    @ObservationIgnored private var warnedEmptyBattery = false
+    @ObservationIgnored private var terminateObserver: NSObjectProtocol?
 
     @ObservationIgnored private var connectContinuation: CheckedContinuation<Void, Error>?
     @ObservationIgnored private var discoveryContinuation: CheckedContinuation<Void, Error>?
     @ObservationIgnored private var notifyContinuation: CheckedContinuation<Void, Error>?
     @ObservationIgnored private var writeContinuation: CheckedContinuation<Void, Error>?
-    @ObservationIgnored private var readContinuations: [CBUUID: CheckedContinuation<Data, Error>] = [:]
+    private struct PendingRead {
+        let id = UUID()
+        let continuation: CheckedContinuation<Data, Error>
+    }
+
+    @ObservationIgnored private var readContinuations: [CBUUID: PendingRead] = [:]
+    /// Étape de connexion en cours, pour expliquer un délai dépassé.
+    @ObservationIgnored private var connectStep = ""
 
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: .main)
         wantsScan = true // recherche automatique dès que le Bluetooth est prêt
+        #if os(macOS)
+        terminateObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.disconnectOnQuit else { return }
+                self.disconnect()
+            }
+        }
+        #endif
     }
 
     // MARK: Recherche et connexion
@@ -126,10 +210,33 @@ final class RaceBoxLink: NSObject {
         central.scanForPeripherals(withServices: nil,
                                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
         isScanning = true
+        addSystemConnectedDevices()
         scanTask?.cancel()
         scanTask = Task {
             try? await Task.sleep(for: .seconds(15))
             if !Task.isCancelled { stopScanning() }
+        }
+    }
+
+    /// Un RaceBox resté connecté au système (par exemple après un arrêt forcé de l'app) n'apparaît pas
+    /// dans la recherche : on le récupère directement auprès de CoreBluetooth.
+    private func addSystemConnectedDevices() {
+        for peripheral in central.retrieveConnectedPeripherals(withServices: [Self.uartService]) {
+            let id = peripheral.identifier
+            if let name = peripheral.name { knownNames[id] = name }
+            let name = knownNames[id] ?? "RaceBox (\(id.uuidString.prefix(4)))"
+            peripherals[id] = peripheral
+            let device = Device(id: id, name: name, rssi: 0, isRaceBox: true, alreadyConnected: true)
+            if let index = devices.firstIndex(where: { $0.id == id }) {
+                devices[index] = device
+            } else {
+                devices.append(device)
+            }
+            addLog("\(name) est encore connecté au système : il peut être repris.")
+            if autoConnect, case .disconnected = state {
+                addLog("Connexion automatique à \(name).")
+                Task { await connect(device) }
+            }
         }
     }
 
@@ -146,28 +253,49 @@ final class RaceBoxLink: NSObject {
         stopScanning()
         state = .connecting(device.name)
         target.delegate = self
+        var timedOut = false
+        // Le délai ne couvre que les étapes Bluetooth ; les requêtes UBX ont leur propre délai de 5 s.
         let timeout = Task {
             try? await Task.sleep(for: .seconds(20))
             if !Task.isCancelled {
+                timedOut = true
                 central.cancelPeripheralConnection(target)
-                failPending(LinkError.timeout)
+                failPending(LinkError.timeout(connectStep))
             }
         }
         defer { timeout.cancel() }
+        func step(_ name: String) throws {
+            if timedOut { throw LinkError.timeout(connectStep) }
+            connectStep = name
+            addLog("Connexion : \(name)…")
+        }
         do {
+            try step("liaison Bluetooth")
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 connectContinuation = continuation
                 central.connect(target)
             }
             peripheral = target
+            try step("découverte des services")
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 discoveryContinuation = continuation
                 target.discoverServices(nil)
             }
+            try step("lecture des informations du boîtier")
             modelNumber = try? await readString(Self.modelUUID)
             firmware = try? await readString(Self.firmwareUUID)
+            serialNumber = try? await readString(Self.serialUUID)
+            hardwareRevision = try? await readString(Self.hardwareUUID)
+            try step("abonnement aux notifications")
             try await enableNotifications()
+            try step("fin de connexion")
+            timeout.cancel()
             deviceName = device.name
+            // État de la mémoire dès la connexion, pour le résumé de la barre latérale.
+            if supportsRecording {
+                try? await refreshRecordingStatus()
+                try? await fetchRecordingSettings(log: false)
+            }
             state = .connected
             addLog("Connecté à \(device.name) — modèle \(modelNumber ?? "?"), firmware \(firmware ?? "?")")
         } catch {
@@ -220,22 +348,252 @@ final class RaceBoxLink: NSObject {
         }
     }
 
-    func startRecording() async {
+    func startRecording(_ settings: RecordingSettings) async {
         await perform {
-            try await expectAck(id: UBX.RaceBoxID.recordingConfig, payload: RecordingConfig.start,
+            if settings.dataRate.needsFirmware33 { try requireFirmware() }
+            try await expectAck(id: UBX.RaceBoxID.recordingConfig, payload: settings.enablePayload,
                                 nackHint: "Mémoire verrouillée, pleine, ou boîtier non Mini S/Micro.")
-            addLog("Enregistrement autonome démarré (25 Hz). Tu peux te déconnecter.")
+            recordingSettings = settings
+            recordingState = .running
+            addLog("Enregistrement autonome démarré : \(settings.summary). Tu peux te déconnecter.")
+            try? await refreshRecordingStatus()
         }
     }
 
     func stopRecording() async {
         await perform {
-            try await expectAck(id: UBX.RaceBoxID.recordingConfig, payload: RecordingConfig.stop)
+            try await expectAck(id: UBX.RaceBoxID.recordingConfig, payload: RecordingSettings.disablePayload)
             addLog("Enregistrement arrêté.")
+            try? await refreshRecordingStatus()
         }
     }
 
+    /// Lit la configuration d'enregistrement mémorisée par le boîtier (dernière utilisée).
+    func readRecordingSettings() async {
+        await perform {
+            try await fetchRecordingSettings(log: true)
+        }
+    }
+
+    /// Relecture discrète de l'état de la mémoire (sans journal ni alerte), pour le suivi périodique.
+    func pollRecordingStatus() async {
+        guard state == .connected, supportsRecording, !isBusy else { return }
+        isBusy = true
+        defer { isBusy = false }
+        try? await refreshRecordingStatus(log: false)
+    }
+
+    /// Déverrouille la mémoire protégée. Le verrou revient à chaque nouvelle connexion.
+    func unlockMemory(code: UInt32) async {
+        await perform {
+            let bytes = withUnsafeBytes(of: code.littleEndian, Array.init)
+            try await expectAck(id: UBX.RaceBoxID.unlock, payload: bytes, nackHint: "Code de sécurité refusé.")
+            try await refreshRecordingStatus()
+            // Le boîtier répond ACK même si le code est faux quand la mémoire n'est pas protégée.
+            if recordingStatus?.isLocked == true { throw LinkError.unlockFailed }
+            addLog("Mémoire déverrouillée.")
+        }
+    }
+
+    /// Efface toute la mémoire (peut prendre quelques minutes) ; la progression arrive en 0xFF 0x24.
+    func eraseMemory() async {
+        await perform {
+            inbox.removeAll()
+            eraseProgress = 0
+            defer { eraseProgress = nil }
+            try await send(cls: UBX.raceBoxClass, id: UBX.RaceBoxID.erase, payload: [])
+            addLog("Effacement de la mémoire…")
+            while true {
+                guard state == .connected else { throw LinkError.disconnected }
+                guard let frame = await nextFrame(timeout: .seconds(30), matching: {
+                    $0.cls == UBX.raceBoxClass
+                        && (($0.id == UBX.RaceBoxID.erase && $0.payload.count == 1)
+                            || (($0.id == UBX.RaceBoxID.ack || $0.id == UBX.RaceBoxID.nack)
+                                && Array($0.payload.prefix(2)) == [UBX.raceBoxClass, UBX.RaceBoxID.erase]))
+                }) else { throw LinkError.noResponse }
+                if frame.id == UBX.RaceBoxID.erase {
+                    eraseProgress = Int(frame.payload[0])
+                } else if frame.id == UBX.RaceBoxID.nack {
+                    throw LinkError.rejected("Mémoire verrouillée ou autre opération en cours.")
+                } else {
+                    break
+                }
+            }
+            addLog("Effacement terminé.")
+            try? await refreshRecordingStatus()
+        }
+    }
+
+    /// Interrompt l'effacement ; la partie déjà effacée est perdue.
+    func cancelErase() async {
+        guard eraseProgress != nil else { return }
+        try? await send(cls: UBX.raceBoxClass, id: UBX.RaceBoxID.erase, payload: [0xFF])
+    }
+
+    func readRecordingStatus() async {
+        await perform { try await refreshRecordingStatus() }
+    }
+
+    /// Télécharge toute la mémoire (messages 0xFF 0x21) puis la découpe en sessions.
+    func downloadRecording() async {
+        await perform {
+            try await refreshRecordingStatus()
+            guard let status = recordingStatus else { throw LinkError.noResponse }
+            if status.storedMessages == 0 {
+                addLog("La mémoire du boîtier est vide.")
+                return
+            }
+            if status.isLocked { throw LinkError.memoryLocked }
+
+            downloadBuffer = []
+            downloadBoundaries = []
+            downloadedCount = 0
+            downloadExpected = status.storedMessages
+            isDownloading = true
+            defer { isDownloading = false }
+            inbox.removeAll()
+            try await send(cls: UBX.raceBoxClass, id: UBX.RaceBoxID.download, payload: [])
+            lastDownloadActivity = Date()
+            addLog("Téléchargement de \(status.storedMessages) messages…")
+
+            // Fin du flux : ACK du 0xFF 0x23. On laisse 1 s de grâce au cas où des données suivraient.
+            while true {
+                guard state == .connected else { throw LinkError.disconnected }
+                let reply = await nextFrame(timeout: .seconds(5)) {
+                    $0.cls == UBX.raceBoxClass
+                        && ((($0.id == UBX.RaceBoxID.ack || $0.id == UBX.RaceBoxID.nack)
+                             && Array($0.payload.prefix(2)) == [UBX.raceBoxClass, UBX.RaceBoxID.download])
+                            || ($0.id == UBX.RaceBoxID.download && $0.payload.count == 4))
+                }
+                if let reply, reply.id == UBX.RaceBoxID.download {
+                    // Accord du boîtier : nombre maximal de messages qui vont suivre.
+                    downloadExpected = Int(reply.payload[0]) | Int(reply.payload[1]) << 8
+                        | Int(reply.payload[2]) << 16 | Int(reply.payload[3]) << 24
+                    continue
+                }
+                if let reply {
+                    if reply.id == UBX.RaceBoxID.nack {
+                        throw LinkError.rejected("Mémoire verrouillée ou téléchargement impossible.")
+                    }
+                    let seen = downloadBuffer.count
+                    try? await Task.sleep(for: .seconds(1))
+                    if downloadBuffer.count == seen { break }
+                } else if Date().timeIntervalSince(lastDownloadActivity) > 5 {
+                    throw LinkError.downloadStalled
+                }
+            }
+
+            downloadedCount = downloadBuffer.count
+            sessions = RecordingSession.split(downloadBuffer, boundaries: downloadBoundaries)
+            downloadBuffer = []
+            downloadBoundaries = []
+            addLog("Téléchargement terminé : \(downloadedCount) échantillons, \(sessions.count) session(s).")
+        }
+    }
+
+    /// Annule le téléchargement en cours ; les données déjà reçues sont conservées.
+    func cancelDownload() async {
+        guard isDownloading else { return }
+        try? await send(cls: UBX.raceBoxClass, id: UBX.RaceBoxID.download, payload: [0xFF])
+    }
+
+    func clearLog() {
+        log.removeAll()
+    }
+
     // MARK: Aides
+
+    private func fetchRecordingSettings(log: Bool) async throws {
+        guard let reply = try await request(cls: UBX.raceBoxClass, id: UBX.RaceBoxID.recordingConfig),
+              let decoded = RecordingSettings.fromConfigPayload(reply.payload) else { throw LinkError.noResponse }
+        recordingSettings = decoded.settings
+        if log {
+            addLog("Configuration d'enregistrement (\(decoded.enabled ? "active" : "inactive")) : \(decoded.settings.summary)")
+        }
+    }
+
+    private func refreshRecordingStatus(log: Bool = true) async throws {
+        guard let reply = try await request(cls: UBX.raceBoxClass, id: UBX.RaceBoxID.recordingStatus),
+              let status = RecordingStatus(payload: reply.payload) else { throw LinkError.noResponse }
+        recordingStatus = status
+        if !status.isRecording { recordingState = nil }
+        guard log else { return }
+        addLog("Mémoire : \(status.storedMessages) / \(status.memorySize) messages (\(status.memoryLevel) %)"
+               + (status.isRecording ? ", enregistrement en cours" : "")
+               + (status.isLocked ? ", verrouillée" : ""))
+    }
+
+    private func handleRecordedData(_ frame: UBXFrame) {
+        guard let sample = RaceBoxSample(payload: frame.payload) else { return }
+        downloadBuffer.append(sample)
+        lastDownloadActivity = Date()
+        if downloadBuffer.count % 250 == 0 { downloadedCount = downloadBuffer.count }
+    }
+
+    /// Message 0xFF 0x26 : pendant un téléchargement il délimite les sessions, sinon on le signale.
+    private func handleStateChange(_ frame: UBXFrame) {
+        guard let change = RecordingStateChange(payload: frame.payload) else { return }
+        if isDownloading {
+            if change != .paused { downloadBoundaries.insert(downloadBuffer.count) }
+        } else {
+            addLog("Enregistrement autonome \(change.label).")
+            recordingState = change
+            Task { await pollRecordingStatus() }
+        }
+    }
+
+    /// Flux temps réel 0xFF 0x01 (25 Hz) : on n'en publie que 4 par seconde pour ménager l'interface.
+    private func handleLiveData(_ frame: UBXFrame) {
+        guard let sample = RaceBoxSample(payload: frame.payload) else { return }
+        let now = Date()
+        liveWindowCount += 1
+        let window = now.timeIntervalSince(liveWindowStart)
+        if window >= 2 {
+            liveRate = Double(liveWindowCount) / window
+            liveWindowCount = 0
+            liveWindowStart = now
+        }
+        let reading = PowerReading(byte: sample.powerByte, isMicro: isMicro)
+        if reading != power {
+            power = reading
+            trackBattery(reading, at: now)
+        }
+        if now.timeIntervalSince(lastLivePublish) >= 0.25 {
+            liveSample = sample
+            lastLivePublish = now
+        }
+    }
+
+    /// Estime l'autonomie à partir de la pente de décharge entre deux changements de niveau.
+    /// Le niveau initial est écarté : on ignore depuis combien de temps il était atteint.
+    private func trackBattery(_ reading: PowerReading, at date: Date) {
+        guard case .battery(let percent, let charging) = reading else {
+            batteryHistory = []
+            batteryTimeRemaining = nil
+            return
+        }
+        if charging {
+            batteryHistory = []
+            batteryTimeRemaining = nil
+            return
+        }
+        if percent == 0, !warnedEmptyBattery, recordingStatus?.isRecording != true {
+            // La doc conseille de se déconnecter au plus vite à 0 %, sauf pendant un enregistrement.
+            warnedEmptyBattery = true
+            addLog("⚠️ Batterie vide : déconnecte le boîtier et recharge-le.")
+            errorMessage = "Batterie du RaceBox vide (0 %). Déconnecte-le et recharge-le."
+        }
+        batteryHistory.append((date, percent))
+        let changes = batteryHistory.dropFirst()
+        guard let first = changes.first, let last = changes.last, first.percent > last.percent else {
+            batteryTimeRemaining = nil
+            return
+        }
+        let elapsed = last.date.timeIntervalSince(first.date)
+        guard elapsed >= 120 else { return }
+        let ratePerSecond = Double(first.percent - last.percent) / elapsed
+        batteryTimeRemaining = Double(last.percent) / ratePerSecond
+    }
 
     /// Exécute une opération en série (une seule à la fois) et remonte l'erreur à l'interface.
     private func perform(_ body: () async throws -> Void) async {
@@ -270,8 +628,20 @@ final class RaceBoxLink: NSObject {
         deviceName = nil
         modelNumber = nil
         firmware = nil
+        serialNumber = nil
+        hardwareRevision = nil
+        liveSample = nil
+        liveRate = 0
+        power = nil
+        batteryTimeRemaining = nil
+        batteryHistory = []
+        warnedEmptyBattery = false
+        recordingSettings = nil
+        recordingState = nil
+        eraseProgress = nil
         gnssConfig = nil
         chipInfo = nil
+        recordingStatus = nil
     }
 
     /// Réveille toutes les opérations en attente avec une erreur (déconnexion, délai).
@@ -284,7 +654,7 @@ final class RaceBoxLink: NSObject {
         notifyContinuation = nil
         writeContinuation?.resume(throwing: error)
         writeContinuation = nil
-        for continuation in readContinuations.values { continuation.resume(throwing: error) }
+        for pending in readContinuations.values { pending.continuation.resume(throwing: error) }
         readContinuations = [:]
         if let waiter {
             waiter.continuation.resume(returning: nil)
@@ -297,8 +667,16 @@ final class RaceBoxLink: NSObject {
             throw LinkError.missingCharacteristic(uuid.uuidString)
         }
         let data = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-            readContinuations[uuid] = continuation
+            let pending = PendingRead(continuation: continuation)
+            readContinuations[uuid] = pending
             peripheral.readValue(for: characteristic)
+            // Une caractéristique facultative qui ne répond pas ne doit pas bloquer la connexion.
+            Task {
+                try? await Task.sleep(for: .seconds(3))
+                if readContinuations[uuid]?.id == pending.id {
+                    readContinuations.removeValue(forKey: uuid)?.continuation.resume(throwing: LinkError.noResponse)
+                }
+            }
         }
         // Le boîtier peut terminer ces chaînes par un octet nul.
         return String(decoding: data, as: UTF8.self)
@@ -407,11 +785,17 @@ extension RaceBoxLink: CBCentralManagerDelegate, CBPeripheralDelegate {
         if let index = devices.firstIndex(where: { $0.id == id }) {
             // Les doublons arrivent en rafale : on ne met à jour que si quelque chose change vraiment.
             let old = devices[index]
+            if old.alreadyConnected { return }
             if old.name != device.name || old.isRaceBox != device.isRaceBox || abs(old.rssi - device.rssi) >= 5 {
                 devices[index] = device
             }
         } else {
             devices.append(device)
+        }
+        // Connexion automatique : uniquement un vrai RaceBox (nom annoncé), jamais un appareil quelconque.
+        if autoConnect, isScanning, case .disconnected = state, known?.hasPrefix("RaceBox") == true {
+            addLog("Connexion automatique à \(device.name).")
+            Task { await connect(device) }
         }
     }
 
@@ -484,11 +868,23 @@ extension RaceBoxLink: CBCentralManagerDelegate, CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         if characteristic.uuid == Self.uartTX {
             guard error == nil, let data = characteristic.value else { return }
-            // On ignore le flux de données temps réel (0xFF 0x01, 25 Hz).
-            for frame in parser.feed(data) where !(frame.cls == UBX.raceBoxClass && frame.id == UBX.RaceBoxID.liveData) {
-                receive(frame)
+            for frame in parser.feed(data) {
+                guard frame.cls == UBX.raceBoxClass else {
+                    receive(frame)
+                    continue
+                }
+                switch frame.id {
+                case UBX.RaceBoxID.liveData:
+                    handleLiveData(frame)
+                case UBX.RaceBoxID.recordedData where isDownloading:
+                    handleRecordedData(frame)
+                case UBX.RaceBoxID.recordingStateChange:
+                    handleStateChange(frame)
+                default:
+                    receive(frame)
+                }
             }
-        } else if let continuation = readContinuations.removeValue(forKey: characteristic.uuid) {
+        } else if let continuation = readContinuations.removeValue(forKey: characteristic.uuid)?.continuation {
             if let error {
                 continuation.resume(throwing: error)
             } else {

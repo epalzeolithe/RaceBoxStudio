@@ -139,10 +139,13 @@ nonisolated enum Geo {
 // MARK: - Réduction pour les graphiques
 
 nonisolated struct SeriesPoint: Identifiable, Sendable {
-    let id: Int
+    let pointID: Int
     let time: Double
     let value: Double
     let series: String
+
+    /// Unique même quand plusieurs séries partagent les mêmes échantillons.
+    var id: String { "\(series)#\(pointID)" }
 }
 
 nonisolated enum Downsample {
@@ -152,21 +155,18 @@ nonisolated enum Downsample {
                          value: (TrackPoint) -> Double) -> [SeriesPoint] {
         let valid = points.filter { value($0).isFinite }
         guard valid.count > maxCount, maxCount >= 2 else {
-            return valid.map { SeriesPoint(id: $0.id, time: $0.time, value: value($0), series: series) }
+            return valid.map { SeriesPoint(pointID: $0.id, time: $0.time, value: value($0), series: series) }
         }
-        let bucketSize = Double(valid.count) / Double(maxCount / 2)
+        let buckets = maxCount / 2
         var out: [SeriesPoint] = []
-        out.reserveCapacity(maxCount)
-        var start = 0
-        while start < valid.count {
-            let end = min(valid.count, Int((Double(out.count / 2 + 1) * bucketSize).rounded()))
-            let bucket = valid[start..<max(end, start + 1)]
-            if let low = bucket.min(by: { value($0) < value($1) }), let high = bucket.max(by: { value($0) < value($1) }) {
-                for p in [low, high].sorted(by: { $0.time < $1.time }) {
-                    out.append(SeriesPoint(id: p.id, time: p.time, value: value(p), series: series))
-                }
+        out.reserveCapacity(buckets * 2)
+        for b in 0..<buckets {
+            let bucket = valid[(b * valid.count / buckets)..<((b + 1) * valid.count / buckets)]
+            guard let low = bucket.min(by: { value($0) < value($1) }),
+                  let high = bucket.max(by: { value($0) < value($1) }) else { continue }
+            for p in (low.id == high.id ? [low] : [low, high].sorted { $0.time < $1.time }) {
+                out.append(SeriesPoint(pointID: p.id, time: p.time, value: value(p), series: series))
             }
-            start = max(end, start + 1)
         }
         return out
     }

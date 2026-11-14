@@ -31,7 +31,12 @@ struct StartFlightIntent: StartWorkoutIntent {
     func perform() async throws -> some IntentResult {
         // La séance doit démarrer dans les 30 s : on la lance d'abord, la connexion BLE suit.
         try await MainActor.run { try FlightWorkout.shared.start() }
-        Task { @MainActor in await WatchRaceBoxLink.shared.startRecordingWhenReady() }
+        // Ensuite on lit l'état du RaceBox : il enregistre → on l'arrête (et la séance avec), sinon on le démarre.
+        Task { @MainActor in
+            if await WatchRaceBoxLink.shared.toggleRecordingWhenReady() == false {
+                await FlightWorkout.shared.end()
+            }
+        }
         return .result()
     }
 }

@@ -1,3 +1,4 @@
+import MapKit
 import RealityKit
 import SwiftUI
 
@@ -11,6 +12,10 @@ struct GPXViewerPane: View {
     @State private var exaggeration = 1.0
     @State private var resetToken = 0
     @State private var showImporter = false
+    /// Imagerie satellite plaquée au sol, téléchargée une fois par trajectoire.
+    @State private var satellite = false
+    @State private var satelliteImage: CGImage?
+    @State private var isLoadingSatellite = false
 
     var body: some View {
         Group {
@@ -18,7 +23,8 @@ struct GPXViewerPane: View {
                 viewer(track)
                     .navigationSubtitleIfAvailable(track.name)
             } else {
-                TrackEmptyState(kind: "GPX", isLoading: store.isLoading) { showImporter = true }
+                TrackEmptyState(kind: "GPX", isLoading: store.isLoading, lastFile: store.lastGPXName,
+                                reopenLast: { Task { await store.reopenLast(.gpx) } }) { showImporter = true }
             }
         }
         .toolbar { TrackOpenToolbar(sessions: sessions, open: { showImporter = true },
@@ -34,6 +40,21 @@ struct GPXViewerPane: View {
         .onChange(of: store.gpx?.name) {
             // Le facteur de charge n'existe pas dans un GPX classique.
             if colorMode == .loadFactor, store.gpx?.hasAcceleration != true { colorMode = .speed }
+            satelliteImage = nil
+        }
+        .task(id: "\(store.gpx?.name ?? "")-\(satellite)") { await loadSatelliteIfNeeded() }
+    }
+
+    private func loadSatelliteIfNeeded() async {
+        guard satellite, satelliteImage == nil, let track = store.gpx,
+              let layout = TrajectoryScene.Layout(track: track) else { return }
+        isLoadingSatellite = true
+        defer { isLoadingSatellite = false }
+        do {
+            satelliteImage = try await TrajectoryScene.satelliteImage(region: layout.groundRegion)
+        } catch {
+            satellite = false
+            store.errorMessage = "Imagerie satellite indisponible : \(error.localizedDescription)"
         }
     }
 
@@ -44,8 +65,9 @@ struct GPXViewerPane: View {
                 #if os(visionOS)
                 TrackMapView(route: Downsample.stride(track.points.filter(\.hasPosition), maxCount: 2000))
                 #else
-                Trajectory3DView(track: track, colorMode: colorMode, exaggeration: exaggeration)
-                    .id("\(track.name)-\(colorMode)-\(exaggeration)-\(resetToken)")
+                Trajectory3DView(track: track, colorMode: colorMode, exaggeration: exaggeration,
+                                 groundImage: satellite ? satelliteImage : nil)
+                    .id("\(track.name)-\(colorMode)-\(exaggeration)-\(resetToken)-\(satellite && satelliteImage != nil)")
                 #endif
                 TrajectoryLegend(track: track, colorMode: colorMode)
                     .padding(12)
@@ -79,6 +101,13 @@ struct GPXViewerPane: View {
                 .frame(minWidth: 100, maxWidth: 180)
         }
         .help("Exagère les altitudes pour mieux voir les figures")
+        HStack(spacing: 6) {
+            Toggle("Satellite", isOn: $satellite)
+                .toggleStyle(.switch)
+                .fixedSize()
+            if isLoadingSatellite { ProgressView().controlSize(.small) }
+        }
+        .help("Plaque au sol l'imagerie satellite haute résolution d'Apple Plans")
         Spacer(minLength: 0)
         Button("Recentrer", systemImage: "scope") { resetToken += 1 }
     }
@@ -109,7 +138,8 @@ struct GPXViewerPane: View {
     }
 }
 
-private extension View {
+extension View {
+    /// Sous-titre de fenêtre sur macOS (nom du fichier ouvert) ; sans effet ailleurs.
     @ViewBuilder func navigationSubtitleIfAvailable(_ text: String) -> some View {
         #if os(macOS)
         navigationSubtitle(text)
@@ -203,23 +233,20 @@ struct TrajectoryLegend: View {
             .foregroundStyle(.secondary)
             .frame(width: 160)
             HStack(spacing: 12) {
-                Label("Départ", systemImage: "circle.fill").foregroundStyle(Color(hex: TrajectoryScene.startColor))
-                Label("Arrivée", systemImage: "circle.fill").foregroundStyle(Color(hex: TrajectoryScene.endColor))
+                marker("Départ", color: TrajectoryScene.startColor)
+                marker("Arrivée", color: TrajectoryScene.endColor)
             }
             .font(.caption2)
-            .labelStyle(LegendLabelStyle())
         }
         .padding(10)
         .background(.regularMaterial, in: .rect(cornerRadius: 10))
     }
 
-    /// Pastille colorée + libellé en couleur de texte (jamais la couleur seule).
-    private struct LegendLabelStyle: LabelStyle {
-        func makeBody(configuration: Configuration) -> some View {
-            HStack(spacing: 4) {
-                configuration.icon.font(.system(size: 7))
-                configuration.title.foregroundStyle(.primary)
-            }
+    /// Pastille colorée + libellé en couleur de texte (la couleur ne porte jamais seule l'information).
+    private func marker(_ title: String, color: UInt32) -> some View {
+        HStack(spacing: 4) {
+            Circle().fill(Color(hex: color)).frame(width: 7, height: 7)
+            Text(title)
         }
     }
 }
@@ -231,14 +258,17 @@ struct Trajectory3DView: View {
     let track: FlightTrack
     let colorMode: TrajectoryColorMode
     let exaggeration: Double
+    /// Imagerie satellite à plaquer au sol (nil : grille).
+    let groundImage: CGImage?
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         let dark = colorScheme == .dark
         RealityView { content in
             content.camera = .virtual
-            content.add(TrajectoryScene.build(track: track, colorMode: colorMode,
-                                              exaggeration: Float(exaggeration), dark: dark))
+            content.add(await TrajectoryScene.build(track: track, colorMode: colorMode,
+                                                    exaggeration: Float(exaggeration), dark: dark,
+                                                    groundImage: groundImage))
         }
         .realityViewCameraControls(.orbit)
         .background(dark ? Color(hex: 0x1A1A19) : Color(hex: 0xFCFCFB))
@@ -250,32 +280,95 @@ struct Trajectory3DView: View {
 enum TrajectoryScene {
     static let startColor: UInt32 = 0x0CA30C
     static let endColor: UInt32 = 0xD03B3B
-    /// La scène tient dans un cube d'environ 1 m, centré sur l'origine.
-    private static let size: Float = 1
+    /// Taille de la scène (en mètres virtuels), centrée sur l'origine.
+    private static let size: Float = 1.5
+    /// Inclinaison initiale vers l'observateur : on voit la grille au sol et le relief d'un coup d'œil.
+    private static let initialTilt: Float = 0.5
 
-    static func build(track: FlightTrack, colorMode: TrajectoryColorMode, exaggeration: Float, dark: Bool) -> Entity {
-        let root = Entity()
-        let points = Downsample.stride(track.points.filter { $0.hasPosition && $0.altitude.isFinite }, maxCount: 3000)
-        guard points.count >= 2 else { return root }
-
-        // Coordonnées locales en mètres : x = est, y = haut, z = −nord.
-        let origin = points[0]
-        let minAltitude = points.map(\.altitude).min() ?? origin.altitude
+    /// Repère local commun à la scène et à l'imagerie satellite (indépendant de l'exagération du relief).
+    struct Layout {
+        let points: [TrackPoint]
+        let origin: TrackPoint
+        let minAltitude: Double
         let metersPerDegreeLat = 111_132.0
-        let metersPerDegreeLon = 111_320.0 * cos(origin.latitude * .pi / 180)
-        var positions = points.map { p in
-            SIMD3<Float>(Float((p.longitude - origin.longitude) * metersPerDegreeLon),
-                         Float(p.altitude - minAltitude) * exaggeration,
-                         -Float((p.latitude - origin.latitude) * metersPerDegreeLat))
+        let metersPerDegreeLon: Double
+        /// Centre horizontal de la trajectoire, en mètres depuis le premier point (x = est, z = −nord).
+        let centerX: Double
+        let centerZ: Double
+        /// Côté du carré de sol, en mètres : l'emprise horizontale + 20 % de marge.
+        let groundSide: Double
+
+        init?(track: FlightTrack) {
+            let points = Downsample.stride(track.points.filter { $0.hasPosition && $0.altitude.isFinite }, maxCount: 3000)
+            guard let origin = points.first, points.count >= 2 else { return nil }
+            self.points = points
+            self.origin = origin
+            minAltitude = points.map(\.altitude).min() ?? origin.altitude
+            let lonScale = 111_320.0 * cos(origin.latitude * .pi / 180), latScale = 111_132.0
+            metersPerDegreeLon = lonScale
+            let xs = points.map { ($0.longitude - origin.longitude) * lonScale }
+            let zs = points.map { -($0.latitude - origin.latitude) * latScale }
+            let minX = xs.min() ?? 0, maxX = xs.max() ?? 0, minZ = zs.min() ?? 0, maxZ = zs.max() ?? 0
+            centerX = (minX + maxX) / 2
+            centerZ = (minZ + maxZ) / 2
+            groundSide = max(maxX - minX, maxZ - minZ, 50) * 1.2
         }
+
+        func meters(_ p: TrackPoint, exaggeration: Float) -> SIMD3<Float> {
+            SIMD3<Float>(Float((p.longitude - origin.longitude) * metersPerDegreeLon - centerX),
+                         Float(p.altitude - minAltitude) * exaggeration,
+                         Float(-(p.latitude - origin.latitude) * metersPerDegreeLat - centerZ))
+        }
+
+        /// Zone géographique couverte par le carré de sol, nord en haut.
+        var groundRegion: MKCoordinateRegion {
+            let center = CLLocationCoordinate2D(latitude: origin.latitude - centerZ / metersPerDegreeLat,
+                                                longitude: origin.longitude + centerX / metersPerDegreeLon)
+            return MKCoordinateRegion(center: center,
+                                      span: MKCoordinateSpan(latitudeDelta: groundSide / metersPerDegreeLat,
+                                                             longitudeDelta: groundSide / metersPerDegreeLon))
+        }
+    }
+
+    /// Image satellite haute résolution (4 096 px de côté) de la zone, sans libellés ni relief.
+    static func satelliteImage(region: MKCoordinateRegion) async throws -> CGImage {
+        let options = MKMapSnapshotter.Options()
+        options.region = region
+        options.size = CGSize(width: 2048, height: 2048)
+        options.preferredConfiguration = MKImageryMapConfiguration(elevationStyle: .flat)
+        #if os(macOS)
+        options.appearance = NSAppearance(named: .aqua)
+        #else
+        options.traitCollection = UITraitCollection(displayScale: 2)
+        #endif
+        let snapshot = try await MKMapSnapshotter(options: options).start()
+        #if os(macOS)
+        guard let image = snapshot.image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return image
+        #else
+        guard let image = snapshot.image.cgImage else { throw CocoaError(.fileReadCorruptFile) }
+        return image
+        #endif
+    }
+
+    static func build(track: FlightTrack, colorMode: TrajectoryColorMode, exaggeration: Float, dark: Bool,
+                      groundImage: CGImage? = nil) async -> Entity {
+        let root = Entity()
+        guard let layout = Layout(track: track) else { return root }
+        let points = layout.points
+
+        // Coordonnées locales en mètres (x = est, y = haut, z = −nord), puis mise à l'échelle de la scène.
+        var positions = points.map { layout.meters($0, exaggeration: exaggeration) }
         let lower = positions.reduce(positions[0]) { pointwiseMin($0, $1) }
         let upper = positions.reduce(positions[0]) { pointwiseMax($0, $1) }
         let extent = upper - lower
-        let scale = size / max(extent.x, extent.y, extent.z, 1)
-        let center = SIMD3<Float>((lower.x + upper.x) / 2, 0, (lower.z + upper.z) / 2)
+        let scale = size / max(Float(layout.groundSide) / 1.2, extent.y, 1)
         let lift = extent.y * scale / 2 // centre vertical de la scène sur l'origine
-        positions = positions.map { ($0 - center) * scale - SIMD3<Float>(0, lift, 0) }
+        positions = positions.map { $0 * scale - SIMD3<Float>(0, lift, 0) }
         let groundY = -lift
+        let half = Float(layout.groundSide) * scale / 2
         let radius: Float = 0.004
 
         // Tube coloré par tranches de valeur.
@@ -288,7 +381,9 @@ enum TrajectoryScene {
             root.addChild(ModelEntity(mesh: mesh, materials: materials))
         }
 
-        let guide = dark ? platformColor(0x8A8984, alpha: 0.5) : platformColor(0x9A9893, alpha: 0.45)
+        // Sur l'imagerie satellite, des repères clairs restent lisibles sur le terrain sombre.
+        let guide = groundImage != nil ? platformColor(0xFFFFFF, alpha: 0.6)
+            : dark ? platformColor(0x8A8984, alpha: 0.5) : platformColor(0x9A9893, alpha: 0.45)
 
         // Ombre au sol : la même trace aplatie, pour lire la position horizontale.
         let shadow = positions.map { SIMD3<Float>($0.x, groundY + 0.001, $0.z) }
@@ -308,8 +403,28 @@ enum TrajectoryScene {
             root.addChild(line)
         }
 
-        // Grille au sol.
-        let half = size * 0.6
+        // Sol : imagerie satellite si demandée, sinon grille.
+        if let groundImage, let texture = try? await TextureResource(image: groundImage, options: .init(semantic: .color)) {
+            var material = UnlitMaterial()
+            material.color = .init(tint: .white, texture: .init(texture))
+            let ground = ModelEntity(mesh: .generatePlane(width: 2 * half, depth: 2 * half), materials: [material])
+            ground.position = SIMD3<Float>(0, groundY - 0.001, 0)
+            root.addChild(ground)
+        } else {
+            addGrid(to: root, half: half, groundY: groundY, dark: dark)
+        }
+        // Départ et arrivée.
+        for (position, color) in [(positions[0], startColor), (positions[positions.count - 1], endColor)] {
+            let marker = ModelEntity(mesh: .generateSphere(radius: radius * 3.5),
+                                     materials: [UnlitMaterial(color: platformColor(color))])
+            marker.position = position
+            root.addChild(marker)
+        }
+        root.orientation = simd_quatf(angle: initialTilt, axis: [1, 0, 0])
+        return root
+    }
+
+    private static func addGrid(to root: Entity, half: Float, groundY: Float, dark: Bool) {
         let divisions = 10
         let gridColor = dark ? platformColor(0x383835) : platformColor(0xE4E2DD)
         for i in 0...divisions {
@@ -321,15 +436,6 @@ enum TrajectoryScene {
                 root.addChild(line)
             }
         }
-
-        // Départ et arrivée.
-        for (position, color) in [(positions[0], startColor), (positions[positions.count - 1], endColor)] {
-            let marker = ModelEntity(mesh: .generateSphere(radius: radius * 3.5),
-                                     materials: [UnlitMaterial(color: platformColor(color))])
-            marker.position = position
-            root.addChild(marker)
-        }
-        return root
     }
 
     #if os(macOS)
@@ -426,6 +532,36 @@ private enum Tube {
     }
     let store = ViewerStore()
     GPXViewerPane(store: store, sessions: [])
-        .task { store.previewLoad(FlightTrack(name: "Boucle d'essai", startDate: .now, points: points)) }
+        .task { store.showInBoth(FlightTrack(name: "Boucle d'essai", startDate: .now, points: points)) }
         .frame(width: 900, height: 650)
 }
+
+#if !os(visionOS)
+/// Vérifie le sens de l'image au sol : nord-ouest rouge, nord-est jaune, sud gris.
+/// La trace part du sud (point vert) et finit au nord-ouest (point rouge) : celui-ci doit tomber sur le quadrant rouge.
+#Preview("Orientation du sol") {
+    let points = (0..<200).map { i -> TrackPoint in
+        let t = Double(i) / 199
+        var p = TrackPoint(id: i, time: Double(i))
+        p.latitude = 44.0 + 0.01 * t
+        p.longitude = 1.0 - 0.006 * t
+        p.altitude = 500 + 300 * sin(t * .pi)
+        p.speed = 50
+        return p
+    }
+    let size = 256
+    let context = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    context.setFillColor(gray: 0.6, alpha: 1)
+    context.fill(CGRect(x: 0, y: 0, width: size, height: size))
+    // CGContext a son origine en bas à gauche : y haut = haut de l'image = nord.
+    context.setFillColor(red: 0.9, green: 0.1, blue: 0.1, alpha: 1)
+    context.fill(CGRect(x: 0, y: size / 2, width: size / 2, height: size / 2))
+    context.setFillColor(red: 0.95, green: 0.8, blue: 0.1, alpha: 1)
+    context.fill(CGRect(x: size / 2, y: size / 2, width: size / 2, height: size / 2))
+    let image = context.makeImage()!
+    return Trajectory3DView(track: FlightTrack(name: "Nord", startDate: nil, points: points),
+                            colorMode: .altitude, exaggeration: 1, groundImage: image)
+        .frame(width: 700, height: 500)
+}
+#endif

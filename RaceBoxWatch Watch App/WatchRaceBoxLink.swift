@@ -32,6 +32,9 @@ struct CommandResult: Equatable {
 /// Le boîtier n'accepte qu'un seul client : ferme l'app RaceBox du téléphone avant de t'y connecter.
 @Observable
 final class WatchRaceBoxLink: NSObject {
+    /// Instance unique, partagée par l'interface et les intentions du bouton Action.
+    static let shared = WatchRaceBoxLink()
+
     enum Connection: Equatable {
         case idle
         case searching
@@ -43,6 +46,15 @@ final class WatchRaceBoxLink: NSObject {
     private(set) var connection: Connection = .idle
     private(set) var isBusy = false
     private(set) var lastResult: CommandResult?
+    private(set) var memory: MemoryStatus?
+    /// Le boîtier ne répond pas à la lecture de la mémoire (RaceBox Mini sans enregistrement autonome).
+    private(set) var memoryUnavailable = false
+    /// Pause signalée en direct par le boîtier (filtre d'arrêt ou de fix).
+    private(set) var isPaused = false
+    private(set) var live: LiveSnapshot?
+    private(set) var power: PowerReading?
+    /// Autonomie batterie estimée d'après la vitesse de décharge observée, en secondes.
+    private(set) var batteryTimeRemaining: TimeInterval?
 
     var isConnected: Bool {
         if case .connected = connection { return true }
@@ -76,6 +88,12 @@ final class WatchRaceBoxLink: NSObject {
     @ObservationIgnored private var waiter: Waiter?
     @ObservationIgnored private var searchTask: Task<Void, Never>?
     @ObservationIgnored private var pendingServiceDiscoveries = 0
+    @ObservationIgnored private var pollTask: Task<Void, Never>?
+    @ObservationIgnored private var isMicro = false
+    /// Déconnexion demandée par l'utilisateur : pas de signal d'erreur.
+    @ObservationIgnored private var userRequestedDisconnect = false
+    /// Changements de niveau de batterie observés hors charge (date, %).
+    @ObservationIgnored private var batteryHistory: [(date: Date, percent: Int)] = []
 
     @ObservationIgnored private var connectContinuation: CheckedContinuation<Void, Error>?
     @ObservationIgnored private var discoveryContinuation: CheckedContinuation<Void, Error>?
@@ -104,6 +122,7 @@ final class WatchRaceBoxLink: NSObject {
     }
 
     func disconnect() {
+        userRequestedDisconnect = true
         searchTask?.cancel()
         if connection == .searching { central.stopScan() }
         if let peripheral { central.cancelPeripheralConnection(peripheral) } else { connection = .idle }
@@ -155,7 +174,11 @@ final class WatchRaceBoxLink: NSObject {
             }
             UserDefaults.standard.set(target.identifier.uuidString, forKey: Self.savedDeviceKey)
             connection = .connected(candidate.name)
+            // Efface une erreur antérieure (« Pas connecté », « Aucun RaceBox trouvé »…) devenue fausse.
+            lastResult = nil
+            isMicro = candidate.name.localizedCaseInsensitiveContains("Micro")
             WKInterfaceDevice.current().play(.success)
+            startPolling()
         } catch {
             central.cancelPeripheralConnection(target)
             resetConnection()
@@ -166,14 +189,68 @@ final class WatchRaceBoxLink: NSObject {
     // MARK: Commandes
 
     func startRecording() async {
-        await runCommand(payload: RecordingConfig.start, success: "Enregistrement démarré")
+        await runCommand(payload: RecordingConfig.start, success: "Enregistrement démarré", haptic: .start)
     }
 
     func stopRecording() async {
-        await runCommand(payload: RecordingConfig.stop, success: "Enregistrement arrêté")
+        await runCommand(payload: RecordingConfig.stop, success: "Enregistrement arrêté", haptic: .stop)
     }
 
-    private func runCommand(payload: [UInt8], success: String) async {
+    /// Pour le bouton Action : se connecte si besoin, relit l'état réel du boîtier, puis
+    /// l'arrête s'il enregistre, le démarre sinon.
+    /// Renvoie `true` si la séance doit continuer, `false` si l'enregistrement est arrêté,
+    /// `nil` si l'état n'a pas pu être déterminé (rien n'a été envoyé).
+    func toggleRecordingWhenReady() async -> Bool? {
+        guard await waitUntilReady() else {
+            report("RaceBox introuvable : aucune action effectuée.", isError: true)
+            return nil
+        }
+        guard let isRecording = await readRecordingState() else {
+            report("État du RaceBox illisible : aucune action effectuée.", isError: true)
+            return nil
+        }
+        if isRecording {
+            await stopRecording()
+            // Si l'arrêt a échoué, le boîtier enregistre toujours : on garde la séance.
+            return memory?.isRecording == true
+        }
+        await startRecording()
+        return true
+    }
+
+    /// Relit l'état du boîtier ; `nil` si la lecture échoue (on ne se fie pas à une valeur périmée).
+    private func readRecordingState() async -> Bool? {
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            try await refreshMemory()
+        } catch {
+            return nil
+        }
+        return memory?.isRecording
+    }
+
+    func stopRecordingWhenReady() async {
+        guard await waitUntilReady() else {
+            report("RaceBox introuvable : enregistrement non arrêté.", isError: true)
+            return
+        }
+        await stopRecording()
+    }
+
+    /// Relance la recherche tant qu'il le faut, jusqu'à 25 s.
+    private func waitUntilReady() async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(25)
+        while ContinuousClock.now < deadline {
+            if isConnected, !isBusy { return true }
+            if connection == .idle { ensureConnected() }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        return false
+    }
+
+    /// `haptic` : vibration propre au démarrage / à l'arrêt, reconnaissable sans regarder l'écran.
+    private func runCommand(payload: [UInt8], success: String, haptic: WKHapticType) async {
         guard isConnected else {
             report(WatchLinkError.notConnected.localizedDescription, isError: true)
             return
@@ -183,15 +260,75 @@ final class WatchRaceBoxLink: NSObject {
         defer { isBusy = false }
         do {
             try await expectAck(id: UBX.RaceBoxID.recordingConfig, payload: payload)
-            report(success, isError: false)
+            isPaused = false
+            report(success, isError: false, haptic: haptic)
+            try? await refreshMemory()
         } catch {
             report(error.localizedDescription, isError: true)
         }
     }
 
-    private func report(_ text: String, isError: Bool) {
+    private func report(_ text: String, isError: Bool, haptic: WKHapticType? = nil) {
         lastResult = CommandResult(text: text, isError: isError)
-        WKInterfaceDevice.current().play(isError ? .failure : .success)
+        WKInterfaceDevice.current().play(haptic ?? (isError ? .failure : .success))
+    }
+
+    // MARK: Suivi de l'état
+
+    /// Relit la mémoire tout de suite, puis toutes les 15 s pendant un enregistrement (60 s sinon).
+    private func startPolling() {
+        pollTask?.cancel()
+        pollTask = Task {
+            while !Task.isCancelled, isConnected {
+                if !isBusy {
+                    isBusy = true
+                    do {
+                        try await refreshMemory()
+                    } catch {
+                        if memory == nil { memoryUnavailable = true }
+                    }
+                    isBusy = false
+                }
+                try? await Task.sleep(for: memory?.isRecording == true ? .seconds(15) : .seconds(60))
+            }
+        }
+    }
+
+    private func refreshMemory() async throws {
+        inbox.removeAll()
+        try await send(id: UBX.RaceBoxID.recordingStatus, payload: [])
+        guard let reply = await nextFrame(timeout: .seconds(5), matching: {
+            $0.cls == UBX.raceBoxClass && $0.id == UBX.RaceBoxID.recordingStatus
+        }), let status = MemoryStatus(payload: reply.payload) else { throw WatchLinkError.noResponse }
+        memory = status
+        memoryUnavailable = false
+        if !status.isRecording { isPaused = false }
+    }
+
+    /// Flux 25 Hz : on ne publie que ce qui change, pour ménager la batterie de la montre.
+    private func handleLive(_ frame: UBXFrame) {
+        guard let snapshot = LiveSnapshot(payload: frame.payload) else { return }
+        if snapshot != live { live = snapshot }
+        let reading = PowerReading(byte: snapshot.powerByte, isMicro: isMicro)
+        guard reading != power else { return }
+        power = reading
+        trackBattery(reading)
+    }
+
+    /// Estime l'autonomie à partir de la pente de décharge entre deux changements de niveau.
+    /// Le niveau initial est écarté : on ignore depuis combien de temps il était atteint.
+    private func trackBattery(_ reading: PowerReading) {
+        guard case .battery(let percent, let charging) = reading, !charging else {
+            batteryHistory = []
+            batteryTimeRemaining = nil
+            return
+        }
+        batteryHistory.append((Date(), percent))
+        let changes = batteryHistory.dropFirst()
+        guard let first = changes.first, let last = changes.last, first.percent > last.percent else { return }
+        let elapsed = last.date.timeIntervalSince(first.date)
+        guard elapsed >= 120 else { return }
+        batteryTimeRemaining = Double(last.percent) * elapsed / Double(first.percent - last.percent)
     }
 
     // MARK: Échanges UBX
@@ -259,6 +396,15 @@ final class WatchRaceBoxLink: NSObject {
         parser = UBXParser()
         inbox = []
         connection = .idle
+        pollTask?.cancel()
+        pollTask = nil
+        memory = nil
+        memoryUnavailable = false
+        isPaused = false
+        live = nil
+        power = nil
+        batteryTimeRemaining = nil
+        batteryHistory = []
     }
 
     /// Réveille toutes les opérations en attente avec une erreur (déconnexion, délai).
@@ -318,7 +464,10 @@ extension WatchRaceBoxLink: CBCentralManagerDelegate, CBPeripheralDelegate {
         failPending(error ?? WatchLinkError.disconnected)
         let wasConnected = isConnected
         resetConnection()
-        if wasConnected { report("RaceBox déconnecté.", isError: true) }
+        if wasConnected {
+            report(userRequestedDisconnect ? "Déconnecté" : "RaceBox déconnecté.", isError: !userRequestedDisconnect)
+        }
+        userRequestedDisconnect = false
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
@@ -371,9 +520,17 @@ extension WatchRaceBoxLink: CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard characteristic.uuid == Self.uartTX, error == nil, let data = characteristic.value else { return }
-        // On ignore le flux de données temps réel (0xFF 0x01, 25 Hz).
-        for frame in parser.feed(data) where !(frame.cls == UBX.raceBoxClass && frame.id == UBX.RaceBoxID.liveData) {
-            receive(frame)
+        for frame in parser.feed(data) {
+            switch (frame.cls, frame.id) {
+            case (UBX.raceBoxClass, UBX.RaceBoxID.liveData):
+                handleLive(frame)
+            case (UBX.raceBoxClass, UBX.RaceBoxID.recordingStateChange):
+                // 0 arrêté, 1 en cours, 2 en pause : on relit la mémoire pour rester à jour.
+                isPaused = frame.payload.first == 2
+                startPolling()
+            default:
+                receive(frame)
+            }
         }
     }
 }

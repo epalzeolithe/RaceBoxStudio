@@ -25,7 +25,9 @@ enum UBX {
         static let liveData: UInt8 = 0x01
         static let ack: UInt8 = 0x02
         static let nack: UInt8 = 0x03
+        static let recordingStatus: UInt8 = 0x22
         static let recordingConfig: UInt8 = 0x25
+        static let recordingStateChange: UInt8 = 0x26
     }
 
     /// Somme de contrôle de Fletcher-8 calculée sur classe, id, longueur et charge utile.
@@ -88,4 +90,66 @@ enum RecordingConfig {
     /// le filtre No-Fix couperait l'enregistrement pendant un vol dos prolongé.
     static let start: [UInt8] = [1, 0, 0x01, 0] + [UInt8](repeating: 0, count: 8)
     static let stop = [UInt8](repeating: 0, count: 12)
+}
+
+// MARK: - État de la mémoire (0xFF 0x22)
+
+struct MemoryStatus: Equatable {
+    let isRecording: Bool
+    let isLocked: Bool
+    let storedMessages: Int
+    /// Capacité, en messages de données.
+    let memorySize: Int
+
+    init?(payload p: [UInt8]) {
+        guard p.count >= 12 else { return nil }
+        func u32(_ o: Int) -> Int { Int(p[o]) | Int(p[o + 1]) << 8 | Int(p[o + 2]) << 16 | Int(p[o + 3]) << 24 }
+        isRecording = p[0] != 0
+        isLocked = p[2] & 0x01 != 0 && p[2] & 0x02 == 0
+        storedMessages = u32(4)
+        memorySize = u32(8)
+    }
+
+    var freeRatio: Double {
+        guard memorySize > 0 else { return 0 }
+        return Double(max(memorySize - storedMessages, 0)) / Double(memorySize)
+    }
+
+    /// Durée restante à 25 Hz, la fréquence utilisée par la montre.
+    var remainingTime: TimeInterval { Double(max(memorySize - storedMessages, 0)) / 25 }
+}
+
+// MARK: - Extrait du message de données (0xFF 0x01)
+
+/// Seuls les champs utiles à l'écran de la montre, pour ne pas tout décoder 25 fois par seconde.
+struct LiveSnapshot: Equatable {
+    let fixStatus: UInt8
+    let satellites: Int
+    /// Fix 3D avec le bit « fix valide » levé (recommandation de la doc).
+    let hasGoodFix: Bool
+    /// Batterie (Mini / Mini S) ou tension d'entrée (Micro).
+    let powerByte: UInt8
+
+    init?(payload p: [UInt8]) {
+        guard p.count == 80 else { return nil }
+        fixStatus = p[20]
+        hasGoodFix = p[20] == 3 && p[21] & 0x01 != 0
+        satellites = Int(p[23])
+        powerByte = p[67]
+    }
+}
+
+enum PowerReading: Equatable {
+    /// Mini / Mini S : bit de poids fort = en charge, 7 bits restants = niveau en %.
+    case battery(percent: Int, charging: Bool)
+    /// Micro : pas de batterie, tension d'entrée (octet / 10).
+    case inputVoltage(Double)
+
+    init(byte: UInt8, isMicro: Bool) {
+        if isMicro {
+            self = .inputVoltage(Double(byte) / 10)
+        } else {
+            self = .battery(percent: Int(byte & 0x7F), charging: byte & 0x80 != 0)
+        }
+    }
 }

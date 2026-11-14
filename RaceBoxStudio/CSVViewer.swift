@@ -21,8 +21,23 @@ final class ViewerStore {
     private(set) var isLoading = false
     var errorMessage: String?
 
+    enum Kind: String {
+        case csv, gpx
+        var bookmarkKey: String { "lastViewerFile.\(rawValue).bookmark" }
+        var nameKey: String { "lastViewerFile.\(rawValue).name" }
+    }
+
+    /// Nom du dernier fichier ouvert (proposé à la réouverture), par type de visionneuse.
+    private(set) var lastCSVName: String?
+    private(set) var lastGPXName: String?
+
+    init() {
+        lastCSVName = UserDefaults.standard.string(forKey: Kind.csv.nameKey)
+        lastGPXName = UserDefaults.standard.string(forKey: Kind.gpx.nameKey)
+    }
+
     func openCSV(_ url: URL) async {
-        await load(url) { data, name in
+        await load(url, kind: .csv) { data, name in
             let text = String(decoding: data, as: UTF8.self)
             let result = try CSVReader.read(text, name: name)
             return LoadedCSV(table: result.table, track: result.track, charts: TrackChartData(track: result.track))
@@ -30,7 +45,58 @@ final class ViewerStore {
     }
 
     func openGPX(_ url: URL) async {
-        await load(url) { data, name in try GPXReader.read(data, name: name) } apply: { self.gpx = $0 }
+        await load(url, kind: .gpx) { data, name in try GPXReader.read(data, name: name) } apply: { self.gpx = $0 }
+    }
+
+    /// Recharge le dernier fichier ouvert dans cette visionneuse, via son signet.
+    func reopenLast(_ kind: Kind) async {
+        guard let bookmark = UserDefaults.standard.data(forKey: kind.bookmarkKey) else { return }
+        var isStale = false
+        do {
+            let url = try URL(resolvingBookmarkData: bookmark, options: Self.resolutionOptions, bookmarkDataIsStale: &isStale)
+            switch kind {
+            case .csv: await openCSV(url)
+            case .gpx: await openGPX(url)
+            }
+        } catch {
+            forget(kind)
+            errorMessage = "Impossible de rouvrir le dernier fichier : \(error.localizedDescription)"
+        }
+    }
+
+    #if os(macOS)
+    private static let creationOptions: URL.BookmarkCreationOptions = .withSecurityScope
+    private static let resolutionOptions: URL.BookmarkResolutionOptions = .withSecurityScope
+    #else
+    private static let creationOptions: URL.BookmarkCreationOptions = []
+    private static let resolutionOptions: URL.BookmarkResolutionOptions = []
+    #endif
+
+    /// Appelé pendant l'accès au fichier, tant que l'URL est encore utilisable.
+    private func remember(_ url: URL, name: String, kind: Kind) {
+        guard let bookmark = try? url.bookmarkData(options: Self.creationOptions) else { return }
+        UserDefaults.standard.set(bookmark, forKey: kind.bookmarkKey)
+        UserDefaults.standard.set(name, forKey: kind.nameKey)
+        setLastName(name, kind)
+    }
+
+    private func forget(_ kind: Kind) {
+        UserDefaults.standard.removeObject(forKey: kind.bookmarkKey)
+        UserDefaults.standard.removeObject(forKey: kind.nameKey)
+        setLastName(nil, kind)
+    }
+
+    private func setLastName(_ name: String?, _ kind: Kind) {
+        switch kind {
+        case .csv: lastCSVName = name
+        case .gpx: lastGPXName = name
+        }
+    }
+
+    /// Affiche une trajectoire déjà construite dans les deux visionneuses (aperçus).
+    func showInBoth(_ track: FlightTrack) {
+        gpx = track
+        csv = LoadedCSV(table: nil, track: track, charts: TrackChartData(track: track))
     }
 
     /// Affiche directement une session téléchargée, sans passer par un export.
@@ -44,7 +110,7 @@ final class ViewerStore {
     }
 
     /// Lecture et analyse hors de l'acteur principal : un CSV d'une heure à 25 Hz fait 90 000 lignes.
-    private func load<T: Sendable>(_ url: URL, parse: @escaping @Sendable (Data, String) throws -> T,
+    private func load<T: Sendable>(_ url: URL, kind: Kind, parse: @escaping @Sendable (Data, String) throws -> T,
                                    apply: (T) -> Void) async {
         isLoading = true
         defer { isLoading = false }
@@ -55,6 +121,7 @@ final class ViewerStore {
             let data = try Data(contentsOf: url)
             let value = try await Task.detached(priority: .userInitiated) { try parse(data, name) }.value
             apply(value)
+            remember(url, name: url.lastPathComponent, kind: kind)
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -127,9 +194,10 @@ struct CSVViewerPane: View {
                     case .table: rawTable(csv)
                     }
                 }
-                .navigationSubtitle(csv.track.name)
+                .navigationSubtitleIfAvailable(csv.track.name)
             } else {
-                TrackEmptyState(kind: "CSV", isLoading: store.isLoading) { showImporter = true }
+                TrackEmptyState(kind: "CSV", isLoading: store.isLoading, lastFile: store.lastCSVName,
+                                reopenLast: { Task { await store.reopenLast(.csv) } }) { showImporter = true }
             }
         }
         .toolbar { TrackOpenToolbar(sessions: sessions, open: { showImporter = true },
@@ -154,18 +222,15 @@ struct CSVViewerPane: View {
     }
 }
 
-#if !os(macOS)
-private extension View {
-    /// Pas de sous-titre de barre de navigation hors macOS : sans effet.
-    func navigationSubtitle(_ text: String) -> some View { self }
-}
-#endif
 
 // MARK: - Éléments communs aux deux visionneuses
 
 struct TrackEmptyState: View {
     let kind: String
     let isLoading: Bool
+    /// Nom du dernier fichier ouvert : s'il existe, on propose de le recharger.
+    var lastFile: String?
+    var reopenLast: () -> Void = {}
     let open: () -> Void
 
     var body: some View {
@@ -177,8 +242,14 @@ struct TrackEmptyState: View {
             } description: {
                 Text("Ouvre un fichier \(kind) ou glisse-le ici. Tu peux aussi afficher une session téléchargée.")
             } actions: {
-                Button("Ouvrir un fichier \(kind)…", action: open)
-                    .buttonStyle(.borderedProminent)
+                if let lastFile {
+                    Button("Rouvrir « \(lastFile) »", systemImage: "arrow.counterclockwise", action: reopenLast)
+                        .buttonStyle(.borderedProminent)
+                    Button("Ouvrir un autre fichier \(kind)…", action: open)
+                } else {
+                    Button("Ouvrir un fichier \(kind)…", action: open)
+                        .buttonStyle(.borderedProminent)
+                }
             }
         }
     }
@@ -211,20 +282,33 @@ struct TrackSummaryView: View {
     let route: [TrackPoint]
 
     var body: some View {
-        ScrollView {
+        // La carte occupe toute la hauteur restante, jusqu'à la console, et suit le redimensionnement.
+        // Fenêtre trop basse : on bascule sur une page défilante avec une carte de hauteur fixe.
+        ViewThatFits(in: .vertical) {
+            content(mapHeight: nil)
+            ScrollView { content(mapHeight: 320) }
+        }
+    }
+
+    private func content(mapHeight: CGFloat?) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 16) {
                 header
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 12)], spacing: 12) {
                     ForEach(tiles, id: \.title) { tile in StatTile(tile: tile) }
                 }
-                if route.count >= 2 {
-                    TrackMapView(route: route)
-                        .frame(height: 320)
-                        .clipShape(.rect(cornerRadius: 12))
-                }
             }
-            .padding()
+            .padding([.horizontal, .top])
+            if route.count >= 2 {
+                TrackMapView(route: route)
+                    .frame(minHeight: mapHeight ?? 220, maxHeight: mapHeight ?? .infinity)
+                    .clipShape(UnevenRoundedRectangle(topLeadingRadius: 12, topTrailingRadius: 12))
+                    .padding(.horizontal)
+            } else {
+                Spacer(minLength: 0)
+            }
         }
+        .frame(maxWidth: .infinity, maxHeight: mapHeight == nil ? .infinity : nil, alignment: .top)
     }
 
     private var header: some View {
@@ -343,7 +427,8 @@ struct TrackChartsView: View {
                     TimeChartCard(title: "Vitesse", unit: "km/h", digits: 0, points: data.speed, selection: $selectedTime)
                 }
                 if track.hasAltitude {
-                    TimeChartCard(title: "Altitude", unit: "m", digits: 0, points: data.altitude, selection: $selectedTime)
+                    TimeChartCard(title: "Altitude", unit: "m", digits: 0, points: data.altitude, includesZero: false,
+                                  selection: $selectedTime)
                 }
                 if track.hasAcceleration {
                     TimeChartCard(title: "Facteur de charge (Z)", unit: "g", digits: 2, points: data.loadFactor,
@@ -359,7 +444,8 @@ struct TrackChartsView: View {
                     EnvelopeChartCard(points: data.envelope)
                 }
                 if track.hasSatellites {
-                    TimeChartCard(title: "Satellites", unit: "", digits: 0, points: data.satellites, selection: $selectedTime)
+                    TimeChartCard(title: "Satellites", unit: "", digits: 0, points: data.satellites, includesZero: false,
+                                  selection: $selectedTime)
                 }
             }
             .padding()
@@ -376,6 +462,8 @@ struct TimeChartCard: View {
     var series: [String] = []
     /// Lignes de repère horizontales (0 g, 1 g…).
     var references: [Double] = []
+    /// Faux pour l'altitude : l'axe part de la valeur la plus basse, pas de 0 m.
+    var includesZero = true
     @Binding var selection: Double?
 
     private var seriesNames: [String] { series.isEmpty ? [points.first?.series ?? title] : series }
@@ -410,6 +498,8 @@ struct TimeChartCard: View {
             .chartLegend(seriesNames.count > 1 ? .visible : .hidden)
             .chartLegend(position: .top, alignment: .leading)
             .chartXSelection(value: $selection)
+            .chartXScale(domain: timeDomain)
+            .chartYScale(domain: .automatic(includesZero: includesZero))
             .chartXAxis {
                 AxisMarks { value in
                     AxisGridLine().foregroundStyle(.quaternary)
@@ -426,6 +516,13 @@ struct TimeChartCard: View {
         }
         .padding(12)
         .background(.background.secondary, in: .rect(cornerRadius: 12))
+    }
+
+    /// L'axe du temps s'arrête à la fin des données (pas d'arrondi qui laisserait un blanc à droite).
+    private var timeDomain: ClosedRange<Double> {
+        let times = points.map(\.time)
+        guard let first = times.min(), let last = times.max(), last > first else { return 0...1 }
+        return first...last
     }
 
     /// « 2:14 · 182 km/h » ou « 2:14 · X +0,12  Y −0,03  Z 3,80 ».
@@ -541,4 +638,44 @@ struct CSVTableView: View {
         let fields = table.fields(of: row)
         return index < fields.count ? String(fields[index]) : ""
     }
+}
+
+// MARK: - Aperçu : vol synthétique
+
+#Preview("Graphiques") {
+    let points = (0..<6000).map { i -> TrackPoint in
+        let t = Double(i) / 25
+        var p = TrackPoint(id: i, time: t)
+        p.latitude = 44.0 + 0.004 * sin(t / 20)
+        p.longitude = 1.0 + 0.006 * sin(t / 10)
+        p.altitude = 900 + 200 * sin(t / 15)
+        p.speed = (180 + 70 * cos(t / 15)) / 3.6
+        p.gZ = 1 + 3.5 * sin(t / 4) * sin(t / 31)
+        p.gX = 0.3 * sin(t / 7)
+        p.gY = 0.5 * cos(t / 5)
+        p.rollRate = 180 * sin(t / 3)
+        p.pitchRate = 60 * cos(t / 6)
+        p.yawRate = 20 * sin(t / 9)
+        p.satellites = 14 + (i % 300 == 0 ? -2 : 0)
+        return p
+    }
+    let track = FlightTrack(name: "Vol d'essai", startDate: .now, points: points)
+    TrackChartsView(track: track, data: TrackChartData(track: track))
+        .frame(width: 800, height: 1400)
+}
+
+#Preview("Résumé") {
+    let points = (0..<3000).map { i -> TrackPoint in
+        let t = Double(i) / 25
+        var p = TrackPoint(id: i, time: t)
+        p.latitude = 44.0 + 0.004 * sin(t / 20)
+        p.longitude = 1.0 + 0.006 * sin(t / 10)
+        p.altitude = 900 + 200 * sin(t / 15)
+        p.speed = (180 + 70 * cos(t / 15)) / 3.6
+        p.gZ = 1 + 3.5 * sin(t / 4)
+        return p
+    }
+    let track = FlightTrack(name: "Vol d'essai", startDate: .now, points: points)
+    TrackSummaryView(track: track, route: Downsample.stride(points, maxCount: 2000))
+        .frame(width: 900, height: 750)
 }
