@@ -505,6 +505,19 @@ final class RaceBoxLink: NSObject {
             }
             for failure in report.failures { self.addLog("Archivage impossible : \(failure)") }
             self.archiveRevision += 1
+
+            // Puis fusion GNSS / IMU de chaque session et création des .fgpx.
+            guard report.folder != nil else { return }
+            self.addLog("Fusion GNSS / IMU en cours…")
+            let fused = await Task.detached(priority: .utility) { SessionArchive.fuse(sessions, after: report) }.value
+            let newFailures = fused.failures.dropFirst(report.failures.count)
+            if !fused.fused.isEmpty {
+                self.addLog("Fusion terminée : \(fused.fused.joined(separator: ", ")) créé(s).")
+            } else if newFailures.isEmpty {
+                self.addLog("Fusion : \(fused.fusionSkipped.count) .fgpx déjà à jour.")
+            }
+            for failure in newFailures { self.addLog("Fusion impossible : \(failure)") }
+            self.archiveRevision += 1
         }
     }
 

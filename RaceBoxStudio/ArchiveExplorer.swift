@@ -7,7 +7,7 @@ import AppKit
 
 /// Visionneuse dans laquelle ouvrir un fichier.
 enum ExplorerTarget {
-    case csv, gpx, fusion
+    case csv, gpx, fusion, fgpx
 }
 
 nonisolated struct ArchivedFile: Identifiable, Hashable, Sendable {
@@ -18,6 +18,8 @@ nonisolated struct ArchivedFile: Identifiable, Hashable, Sendable {
     var id: URL { url }
     var name: String { url.lastPathComponent }
     var isCSV: Bool { url.pathExtension.lowercased() == "csv" }
+    /// « CSV », « GPX » ou « FGPX ».
+    var kind: String { url.pathExtension.uppercased() }
 }
 
 /// Un vol : son CSV et son GPX (même nom, extension différente).
@@ -27,7 +29,9 @@ nonisolated struct ArchivedSession: Identifiable, Hashable, Sendable {
 
     var id: String { stem }
     var csv: ArchivedFile? { files.first(where: \.isCSV) }
-    var gpx: ArchivedFile? { files.first { !$0.isCSV } }
+    var gpx: ArchivedFile? { files.first { $0.kind == "GPX" } }
+    /// Fusion GNSS / IMU créée automatiquement après le téléchargement.
+    var fgpx: ArchivedFile? { files.first { $0.kind == "FGPX" } }
     var totalSize: Int { files.reduce(0) { $0 + $1.size } }
     var modified: Date { files.map(\.modified).max() ?? .distantPast }
 
@@ -53,7 +57,7 @@ nonisolated enum ArchiveListing {
         let urls = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys,
                                                                   options: .skipsHiddenFiles)) ?? []
         var groups: [String: [ArchivedFile]] = [:]
-        for url in urls where ["csv", "gpx"].contains(url.pathExtension.lowercased()) {
+        for url in urls where ["csv", "gpx", "fgpx"].contains(url.pathExtension.lowercased()) {
             let values = try? url.resourceValues(forKeys: Set(keys))
             groups[url.deletingPathExtension().lastPathComponent, default: []].append(
                 ArchivedFile(url: url, size: values?.fileSize ?? 0, modified: values?.contentModificationDate ?? .distantPast))
@@ -70,6 +74,10 @@ nonisolated enum ArchiveListing {
         }
         if let gpx = session.gpx, let data = try? Data(contentsOf: gpx.url) {
             return try? GPXReader.read(data, name: session.stem)
+        }
+        // .fgpx seul (CSV et GPX supprimés ou jamais archivés) : on en relit la trace.
+        if let fgpx = session.fgpx, let data = try? Data(contentsOf: fgpx.url) {
+            return (try? FGPXReader.read(String(decoding: data, as: UTF8.self), name: session.stem))?.track
         }
         return nil
     }
@@ -97,7 +105,7 @@ struct ArchiveExplorerPane: View {
                 ContentUnavailableView {
                     Label("Aucun fichier archivé", systemImage: "folder")
                 } description: {
-                    Text("Les sessions téléchargées depuis le boîtier sont archivées automatiquement (CSV et GPX) dans Documents/RaceBoxStudio.")
+                    Text("Les sessions téléchargées depuis le boîtier sont archivées automatiquement (CSV, GPX et fusion FGPX) dans Documents/RaceBoxStudio.")
                 } actions: {
                     Button("Actualiser", systemImage: "arrow.clockwise") { Task { await reload() } }
                 }
@@ -132,9 +140,9 @@ struct ArchiveExplorerPane: View {
             Button("Supprimer \(session.files.count) fichier(s)", role: .destructive) { delete(session) }
         } message: { session in
             #if os(macOS)
-            Text("Le CSV et le GPX de « \(session.title) » seront mis à la corbeille.")
+            Text("Les fichiers de « \(session.title) » (CSV, GPX, FGPX) seront mis à la corbeille.")
             #else
-            Text("Le CSV et le GPX de « \(session.title) » seront supprimés définitivement.")
+            Text("Les fichiers de « \(session.title) » (CSV, GPX, FGPX) seront supprimés définitivement.")
             #endif
         }
         .alert("Erreur", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } }),
@@ -165,7 +173,10 @@ struct ArchiveExplorerPane: View {
     @ViewBuilder private func actions(for session: ArchivedSession) -> some View {
         if let csv = session.csv {
             Button("Ouvrir dans la visionneuse CSV", systemImage: "chart.xyaxis.line") { open(csv.url, .csv) }
-            Button("Ouvrir dans la fusion GNSS / IMU", systemImage: "airplane") { open(csv.url, .fusion) }
+            Button("Recalculer la fusion GNSS / IMU", systemImage: "airplane") { open(csv.url, .fusion) }
+        }
+        if let fgpx = session.fgpx {
+            Button("Ouvrir la fusion (.fgpx)", systemImage: "airplane") { open(fgpx.url, .fgpx) }
         }
         if let gpx = session.gpx {
             Button("Ouvrir la trajectoire GPX", systemImage: "rotate.3d") { open(gpx.url, .gpx) }
@@ -225,7 +236,7 @@ private struct SessionRow: View {
             Text(session.title).font(.headline)
             HStack(spacing: 8) {
                 ForEach(session.files) { file in
-                    Text("\(file.isCSV ? "CSV" : "GPX") \(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file))")
+                    Text("\(file.kind) \(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file))")
                 }
             }
             .font(.caption)
@@ -279,7 +290,7 @@ private struct SessionDetail: View {
             VStack(alignment: .leading, spacing: 2) {
                 ForEach(session.files) { file in
                     HStack(spacing: 6) {
-                        Image(systemName: file.isCSV ? "tablecells" : "point.topleft.down.to.point.bottomright.curvepath")
+                        Image(systemName: file.isCSV ? "tablecells" : file.kind == "FGPX" ? "airplane" : "point.topleft.down.to.point.bottomright.curvepath")
                             .foregroundStyle(.secondary)
                         Text(file.name).textSelection(.enabled)
                         Text("· \(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file)) · modifié \(file.modified.formatted(date: .abbreviated, time: .shortened))")
@@ -295,7 +306,11 @@ private struct SessionDetail: View {
     @ViewBuilder private var buttons: some View {
         if let csv = session.csv {
             Button("Visionneuse CSV", systemImage: "chart.xyaxis.line") { open(csv.url, .csv) }
-            Button("Fusion GNSS / IMU", systemImage: "airplane") { open(csv.url, .fusion) }
+            Button("Recalculer la fusion", systemImage: "airplane") { open(csv.url, .fusion) }
+        }
+        if let fgpx = session.fgpx {
+            Button("Fusion (.fgpx)", systemImage: "airplane") { open(fgpx.url, .fgpx) }
+                .buttonStyle(.borderedProminent)
         }
         if let gpx = session.gpx {
             Button("Trajectoire GPX", systemImage: "rotate.3d") { open(gpx.url, .gpx) }

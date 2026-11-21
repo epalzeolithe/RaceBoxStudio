@@ -143,6 +143,9 @@ struct ContentView: View {
                     case .fusion:
                         await viewers.openCSV(url)
                         pane = .fusionViewer
+                    case .fgpx:
+                        await viewers.openFGPX(url)
+                        pane = .fusionViewer
                     }
                 }
             }
@@ -877,7 +880,6 @@ private struct RecordingTab: View {
     let link: RaceBoxLink
     @State private var settings = RecordingSettings.aerobatics
     @State private var unlockCode = ""
-    @State private var confirmErase = false
 
     /// Lie un champ UInt16 des réglages à un Stepper entier.
     private func value(_ keyPath: WritableKeyPath<RecordingSettings, UInt16>) -> Binding<Int> {
@@ -955,25 +957,8 @@ private struct RecordingTab: View {
                 }
                 .disabled(link.isBusy)
             }
-
-            Section("Effacement") {
-                if let progress = link.eraseProgress {
-                    ProgressView(value: Double(progress), total: 100) {
-                        Text("Effacement : \(progress) %").font(.caption).monospacedDigit()
-                    }
-                    Button("Interrompre", role: .cancel) { Task { await link.cancelErase() } }
-                } else {
-                    Button("Effacer la mémoire…", role: .destructive) { confirmErase = true }
-                        .disabled(link.isBusy)
-                }
-            }
         }
         .formStyle(.grouped)
-        .confirmationDialog("Effacer toute la mémoire du boîtier ?", isPresented: $confirmErase) {
-            Button("Effacer", role: .destructive) { Task { await link.eraseMemory() } }
-        } message: {
-            Text("Les enregistrements non téléchargés seront perdus. L'opération peut durer quelques minutes.")
-        }
         .onChange(of: link.recordingSettings) { _, new in
             if let new { settings = new }
         }
@@ -986,13 +971,14 @@ private struct RecordingTab: View {
 
 // MARK: - Volet Données
 
-/// Téléchargement de la mémoire du boîtier et export des sessions téléchargées.
+/// Téléchargement et effacement de la mémoire du boîtier, export des sessions téléchargées.
 private struct DataTab: View {
     let link: RaceBoxLink
     @State private var exportFile = ExportFile(text: "")
     @State private var exportType = UTType.commaSeparatedText
     @State private var exportName = "racebox"
     @State private var showExporter = false
+    @State private var confirmErase = false
 
     private func export(_ text: String, type: UTType, name: String) {
         exportFile = ExportFile(text: text)
@@ -1022,7 +1008,7 @@ private struct DataTab: View {
                     }
                 }
                 if !link.sessions.isEmpty {
-                    Text("Sessions téléchargées : archivées automatiquement (CSV et GPX) dans Documents/RaceBoxStudio.")
+                    Text("Sessions téléchargées : archivées automatiquement (CSV, GPX, puis fusion GNSS / IMU en .fgpx) dans Documents/RaceBoxStudio.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 ForEach(link.sessions) { session in
@@ -1044,8 +1030,25 @@ private struct DataTab: View {
                     }
                 }
             }
+
+            Section("Effacement") {
+                if let progress = link.eraseProgress {
+                    ProgressView(value: Double(progress), total: 100) {
+                        Text("Effacement : \(progress) %").font(.caption).monospacedDigit()
+                    }
+                    Button("Interrompre", role: .cancel) { Task { await link.cancelErase() } }
+                } else {
+                    Button("Effacer la mémoire du boîtier…", role: .destructive) { confirmErase = true }
+                        .disabled(link.state != .connected || !link.supportsRecording || link.isBusy)
+                }
+            }
         }
         .formStyle(.grouped)
+        .confirmationDialog("Effacer toute la mémoire du boîtier ?", isPresented: $confirmErase) {
+            Button("Effacer", role: .destructive) { Task { await link.eraseMemory() } }
+        } message: {
+            Text("Les enregistrements non téléchargés seront perdus. L'opération peut durer quelques minutes.")
+        }
         .fileExporter(isPresented: $showExporter, document: exportFile, contentType: exportType,
                       defaultFilename: exportName) { result in
             if case .failure(let error) = result { link.errorMessage = error.localizedDescription }

@@ -18,6 +18,8 @@ final class ViewerStore {
 
     private(set) var csv: LoadedCSV?
     private(set) var gpx: FlightTrack?
+    /// Fusion relue dans un .fgpx : prioritaire dans la visionneuse Fusion jusqu'à l'ouverture d'un CSV ou d'une session.
+    private(set) var fgpx: FGPXDocument?
     private(set) var isLoading = false
     var errorMessage: String?
 
@@ -41,7 +43,27 @@ final class ViewerStore {
             let text = String(decoding: data, as: UTF8.self)
             let result = try CSVReader.read(text, name: name)
             return LoadedCSV(table: result.table, track: result.track, charts: TrackChartData(track: result.track))
-        } apply: { self.csv = $0 }
+        } apply: {
+            self.csv = $0
+            self.fgpx = nil
+        }
+    }
+
+    /// Ouvre un .fgpx (fusion GNSS / IMU déjà calculée) : analyse hors de l'acteur principal.
+    func openFGPX(_ url: URL) async {
+        isLoading = true
+        defer { isLoading = false }
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let name = url.deletingPathExtension().lastPathComponent
+        do {
+            let data = try Data(contentsOf: url)
+            fgpx = try await Task.detached(priority: .userInitiated) {
+                try FGPXReader.read(String(decoding: data, as: UTF8.self), name: name)
+            }.value
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     func openGPX(_ url: URL) async {
@@ -95,6 +117,7 @@ final class ViewerStore {
 
     /// Affiche une trajectoire déjà construite dans les deux visionneuses (aperçus).
     func showInBoth(_ track: FlightTrack) {
+        fgpx = nil
         gpx = track
         csv = LoadedCSV(table: nil, track: track, charts: TrackChartData(track: track))
     }
@@ -102,6 +125,7 @@ final class ViewerStore {
     /// Affiche directement une session téléchargée, sans passer par un export.
     func show(_ session: RecordingSession, inGPX: Bool) {
         let track = session.track
+        if !inGPX { fgpx = nil }
         if inGPX {
             gpx = track
         } else {

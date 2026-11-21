@@ -1,6 +1,7 @@
 import MapKit
 import SceneKit
 import SwiftUI
+import UniformTypeIdentifiers
 import simd
 
 // MARK: - Volet Fusion GNSS / IMU
@@ -16,6 +17,8 @@ struct FusionViewerPane: View {
         let count: Int
         let speedIsThreeD: Bool
         let lateralConstraint: Bool
+        /// Identifiant du .fgpx importé, s'il y en a un.
+        let fgpx: UUID?
     }
 
     private struct Routes {
@@ -58,18 +61,33 @@ struct FusionViewerPane: View {
 
     @Environment(\.horizontalSizeClass) private var sizeClass
 
+    /// Trajectoire affichée : celle du .fgpx importé, sinon celle du CSV ouvert.
+    private var activeTrack: FlightTrack? { store.fgpx?.track ?? store.csv?.track }
+    /// Fusion relue dans un .fgpx : rien n'est recalculé, les réglages du filtre ne s'appliquent pas.
+    private var isImported: Bool { store.fgpx != nil }
+
     private var runKey: RunKey? {
-        store.csv.map { RunKey(name: $0.track.name, count: $0.track.points.count,
-                               speedIsThreeD: speedIsThreeD, lateralConstraint: lateralConstraint) }
+        activeTrack.map { RunKey(name: $0.name, count: $0.points.count, speedIsThreeD: speedIsThreeD,
+                                 lateralConstraint: lateralConstraint, fgpx: store.fgpx?.id) }
+    }
+
+    private func openFile(_ url: URL) {
+        Task {
+            if url.pathExtension.lowercased() == "fgpx" {
+                await store.openFGPX(url)
+            } else {
+                await store.openCSV(url)
+            }
+        }
     }
 
     var body: some View {
         Group {
-            if let track = store.csv?.track {
+            if let track = activeTrack {
                 viewer(track)
                     .navigationSubtitleIfAvailable(track.name)
             } else {
-                TrackEmptyState(kind: "CSV", isLoading: store.isLoading, lastFile: store.lastCSVName,
+                TrackEmptyState(kind: "CSV ou FGPX", isLoading: store.isLoading, lastFile: store.lastCSVName,
                                 reopenLast: { Task { await store.reopenLast(.csv) } }) { showImporter = true }
             }
         }
@@ -78,7 +96,7 @@ struct FusionViewerPane: View {
                              show: { store.show($0, inGPX: false) })
             ToolbarItem {
                 Button("Exporter .fgpx", systemImage: "square.and.arrow.up") { Task { await exportFGPX() } }
-                    .disabled(result == nil || isExporting)
+                    .disabled(result == nil || isExporting || isImported)
                     .help("Exporte la fusion GNSS / IMU (trajectoire corrigée, attitudes, vitesses, accélérations, gyros) dans un fichier .fgpx")
             }
         }
@@ -86,16 +104,24 @@ struct FusionViewerPane: View {
                       defaultFilename: exportName) { outcome in
             if case .failure(let error) = outcome { store.errorMessage = error.localizedDescription }
         }
-        .fileImporter(isPresented: $showImporter, allowedContentTypes: TrackFileType.csv) { result in
-            if case .success(let url) = result { Task { await store.openCSV(url) } }
+        // `.data` : l'extension .fgpx n'est déclarée dans aucun type du système, sans lui le sélecteur grise ces fichiers.
+        // `.data` : l'extension .fgpx n'est déclarée dans aucun type du système, sans lui le sélecteur grise ces fichiers.
+        .fileImporter(isPresented: $showImporter, allowedContentTypes: TrackFileType.csv + [ExportFile.fgpxType, .data]) { result in
+            if case .success(let url) = result { openFile(url) }
         }
         .dropDestination(for: URL.self) { urls, _ in
             guard let url = urls.first else { return false }
-            Task { await store.openCSV(url) }
+            openFile(url)
             return true
         }
-        .task(id: runKey) { await runFusion() }
-        .onChange(of: store.csv?.track.name) {
+        .task(id: runKey) {
+            if let document = store.fgpx {
+                adopt(track: document.track, output: document.result, mounting: document.mounting, config: document.config)
+            } else {
+                await runFusion()
+            }
+        }
+        .onChange(of: activeTrack?.name) {
             isPlaying = false
             time = 0
         }
@@ -142,6 +168,17 @@ struct FusionViewerPane: View {
                 + "un export CSV RaceBoxStudio ou une session téléchargée convient."
             return
         }
+        adopt(track: track, output: output, mounting: MountingCalibration.calibrate(samples: output.smoothed ?? output.filtered),
+              config: config)
+    }
+
+    /// Met en place un résultat de fusion (calculé ici ou relu dans un .fgpx) : routes de la carte, repère de la scène,
+    /// emprise satellite, calage, et curseur au premier point au-dessus de 50 km/h pour un nouveau vol.
+    private func adopt(track: FlightTrack, output: FusionResult, mounting newMounting: MountingCalibration?,
+                       config: FusionConfig) {
+        fusionConfig = config
+        failure = nil
+        isComputing = false
         routes = Routes(raw: Self.coordinates(track.points.filter(FusionFilter.isUsableFix)),
                         filtered: Self.coordinates(output.filtered),
                         smoothed: output.smoothed.map(Self.coordinates) ?? [])
@@ -158,11 +195,11 @@ struct FusionViewerPane: View {
                                           centerLatitude: (minLat + maxLat) / 2, centerLongitude: (minLon + maxLon) / 2,
                                           side: min(30_000, max(10_000, extent * 3)))
         }
-        mounting = MountingCalibration.calibrate(samples: output.smoothed ?? output.filtered)
+        mounting = newMounting
         result = output
         let start = output.filtered.first?.time ?? 0
         let end = output.filtered.last?.time ?? start
-        let key = "\(track.name)-\(track.points.count)"
+        let key = "\(track.name)-\(track.points.count)-\(store.fgpx?.id.uuidString ?? "")"
         if positionedKey != key {
             // Nouveau vol : on saute le roulage et on se place au premier point au-dessus de 50 km/h.
             positionedKey = key
@@ -246,7 +283,14 @@ struct FusionViewerPane: View {
                 HStack(spacing: 16) { controlItems }
                 VStack(alignment: .leading, spacing: 8) { controlItems }
             }
-            if let diagnostics = result?.diagnostics { DiagnosticsLine(diagnostics: diagnostics, smoothed: useSmoother) }
+            if isImported, let document = store.fgpx {
+                Label("Fusion relue dans un fichier .fgpx (\(document.isSmoothed ? "ESKF + RTS" : "ESKF"), "
+                      + "\(document.result.filtered.count.formatted()) échantillons) : rien n'est recalculé.",
+                      systemImage: "doc.badge.gearshape")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else if let diagnostics = result?.diagnostics {
+                DiagnosticsLine(diagnostics: diagnostics, smoothed: useSmoother)
+            }
             if result != nil { Text(mountingSummary).font(.caption).foregroundStyle(.secondary).monospacedDigit() }
         }
         .padding(.horizontal)
@@ -267,15 +311,17 @@ struct FusionViewerPane: View {
         .pickerStyle(.segmented)
         .labelsHidden()
         .fixedSize()
-        .disabled(result?.smoothed == nil)
+        .disabled(result?.smoothed == nil || isImported)
         .help("Le lisseur RTS repasse sur tout le vol : il corrige surtout l'attitude dans les virages")
         Toggle("Vitesse GNSS 3D", isOn: $speedIsThreeD)
             .toggleStyle(.switch)
             .fixedSize()
+            .disabled(isImported)
             .help("Réglage « Vitesse 3D » du boîtier : la vitesse enregistrée inclut alors la composante verticale")
         Toggle("Pas de dérapage", isOn: $lateralConstraint)
             .toggleStyle(.switch)
             .fixedSize()
+            .disabled(isImported)
             .help("Pseudo-mesure : vitesse latérale nulle dans le repère du boîtier (vol coordonné)")
         Toggle("Chase cam", isOn: $chase)
             .toggleStyle(.switch)
