@@ -98,6 +98,8 @@ final class RaceBoxLink: NSObject {
     /// Nombre de messages annoncé par le boîtier au début du téléchargement.
     private(set) var downloadExpected = 0
     private(set) var sessions: [RecordingSession] = []
+    /// Incrémenté à chaque archivage terminé : l'explorateur relit alors le dossier.
+    private(set) var archiveRevision = 0
     private(set) var log: [LogEntry] = []
     var errorMessage: String?
     /// Affiche tous les appareils BLE alentour, pas seulement les RaceBox (aide au diagnostic).
@@ -183,7 +185,7 @@ final class RaceBoxLink: NSObject {
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: .main)
-        wantsScan = true // recherche automatique dès que le Bluetooth est prêt
+        // Pas de recherche ni de connexion au lancement : elles démarrent avec « Rechercher ».
         #if os(macOS)
         terminateObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
@@ -488,6 +490,21 @@ final class RaceBoxLink: NSObject {
             downloadBuffer = []
             downloadBoundaries = []
             addLog("Téléchargement terminé : \(downloadedCount) échantillons, \(sessions.count) session(s).")
+            archiveSessions(sessions)
+        }
+    }
+
+    /// Archive les sessions (CSV + GPX) dans Documents/RaceBoxStudio, hors du fil principal.
+    private func archiveSessions(_ sessions: [RecordingSession]) {
+        Task { [weak self] in
+            let report = await Task.detached(priority: .utility) { SessionArchive.archive(sessions) }.value
+            guard let self else { return }
+            if let folder = report.folder, report.failures.isEmpty {
+                self.addLog("Archivé dans \(folder.path(percentEncoded: false)) : "
+                            + "\(report.written.count) fichier(s) écrit(s), \(report.unchanged.count) déjà présent(s).")
+            }
+            for failure in report.failures { self.addLog("Archivage impossible : \(failure)") }
+            self.archiveRevision += 1
         }
     }
 

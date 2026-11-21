@@ -7,10 +7,11 @@ import UIKit
 
 /// Volets affichés dans la barre latérale.
 private enum Pane: Hashable, CaseIterable {
-    case connection, device, live, recording, settings, csvViewer, gpxViewer
+    case connection, device, live, recording, data, settings, explorer, csvViewer, gpxViewer, fusionViewer
 
     var title: String {
         switch self {
+        case .data: "Données"
         case .connection: "Connexion"
         case .device: "Boîtier"
         case .live: "Temps réel"
@@ -18,11 +19,14 @@ private enum Pane: Hashable, CaseIterable {
         case .settings: "Réglages"
         case .csvViewer: "Visionneuse CSV"
         case .gpxViewer: "Trajectoire GPX"
+        case .fusionViewer: "Fusion GNSS / IMU"
+        case .explorer: "Explorer"
         }
     }
 
     var systemImage: String {
         switch self {
+        case .data: "tray.full"
         case .connection: "antenna.radiowaves.left.and.right"
         case .device: "cpu"
         case .live: "gauge.with.dots.needle.67percent"
@@ -30,6 +34,8 @@ private enum Pane: Hashable, CaseIterable {
         case .settings: "gearshape"
         case .csvViewer: "chart.xyaxis.line"
         case .gpxViewer: "rotate.3d"
+        case .fusionViewer: "airplane"
+        case .explorer: "folder"
         }
     }
 }
@@ -38,6 +44,9 @@ struct ContentView: View {
     @State private var link = RaceBoxLink()
     @State private var pane: Pane? = .connection
     @State private var viewers = ViewerStore()
+    #if os(iOS)
+    @State private var wasInBackground = false
+    #endif
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -78,10 +87,13 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .background:
+                wasInBackground = true
                 // On ne coupe pas un téléchargement ou un effacement en cours.
                 if link.disconnectOnQuit, !link.isDownloading, link.eraseProgress == nil { link.disconnect() }
             case .active:
-                if link.autoConnect, link.state == .disconnected { link.startScanning() }
+                // Seulement au retour d'un passage en arrière-plan : jamais au lancement de l'app.
+                if wasInBackground, link.autoConnect, link.state == .disconnected { link.startScanning() }
+                wasInBackground = false
             default:
                 break
             }
@@ -109,10 +121,31 @@ struct ContentView: View {
             ConnectionPane(link: link)
         case .settings:
             SettingsPane(link: link)
+        case .data:
+            // Les sessions restent en mémoire : le volet reste utilisable sans boîtier connecté.
+            DataTab(link: link)
         case .csvViewer:
             CSVViewerPane(store: viewers, sessions: link.sessions)
         case .gpxViewer:
             GPXViewerPane(store: viewers, sessions: link.sessions)
+        case .fusionViewer:
+            FusionViewerPane(store: viewers, sessions: link.sessions)
+        case .explorer:
+            ArchiveExplorerPane(archiveRevision: link.archiveRevision) { url, target in
+                Task {
+                    switch target {
+                    case .csv:
+                        await viewers.openCSV(url)
+                        pane = .csvViewer
+                    case .gpx:
+                        await viewers.openGPX(url)
+                        pane = .gpxViewer
+                    case .fusion:
+                        await viewers.openCSV(url)
+                        pane = .fusionViewer
+                    }
+                }
+            }
         case .device, .live, .recording:
             if link.state != .connected {
                 ContentUnavailableView("Aucun boîtier connecté",
@@ -163,7 +196,7 @@ private struct SidebarView: View {
             }
             .tag(Pane.connection)
             Section(link.deviceName ?? "Boîtier") {
-                ForEach([Pane.device, .live, .recording], id: \.self) { pane in
+                ForEach([Pane.device, .live, .recording, .data], id: \.self) { pane in
                     NavigationLink(value: pane) {
                         Label(pane.title, systemImage: pane.systemImage)
                     }
@@ -177,7 +210,7 @@ private struct SidebarView: View {
             }
             // Visionneuses : utilisables sans boîtier connecté.
             Section("Fichiers") {
-                ForEach([Pane.csvViewer, .gpxViewer], id: \.self) { pane in
+                ForEach([Pane.explorer, .csvViewer, .gpxViewer, .fusionViewer], id: \.self) { pane in
                     NavigationLink(value: pane) {
                         Label(pane.title, systemImage: pane.systemImage)
                     }
@@ -242,6 +275,7 @@ private struct SidebarView: View {
     }
 
     private func isAvailable(_ pane: Pane) -> Bool {
+        if pane == .data { return true }
         guard link.state == .connected else { return false }
         return pane != .recording || link.supportsRecording
     }
@@ -351,8 +385,62 @@ private struct RecordingStatusCard: View {
             }
 
             recordingButton
+            downloadButton
         }
         .padding(.vertical, 4)
+    }
+
+    /// Lance (ou annule) le téléchargement de la mémoire ; le pourcentage d'avancement s'affiche dessous.
+    @ViewBuilder private var downloadButton: some View {
+        let isDownloading = link.isDownloading
+        Button {
+            Task {
+                if isDownloading {
+                    await link.cancelDownload()
+                } else {
+                    await link.downloadRecording()
+                }
+            }
+        } label: {
+            HStack(spacing: 8) {
+                ZStack {
+                    if isDownloading {
+                        ProgressView().controlSize(.small).tint(.white)
+                    } else {
+                        Image(systemName: "arrow.down.circle")
+                    }
+                }
+                .frame(width: 16, height: 16)
+                Text(isDownloading ? "Annuler" : "Télécharger")
+            }
+        }
+        .buttonStyle(RecordButtonStyle(isRecording: false, tint: .accentColor))
+        .help(isDownloading ? "Annuler le téléchargement" : "Télécharger la mémoire du boîtier")
+        .disabled(!link.supportsRecording || (link.isBusy && !isDownloading))
+        .animation(.snappy, value: isDownloading)
+
+        if isDownloading {
+            let expected = max(link.downloadExpected, 1)
+            let ratio = Double(min(link.downloadedCount, expected)) / Double(expected)
+            // Barre de progression avec le pourcentage dessus.
+            ProgressView(value: ratio)
+                .progressViewStyle(.linear)
+                .tint(.accentColor)
+                .scaleEffect(x: 1, y: 3.2, anchor: .center)
+                .frame(height: 18)
+                .clipShape(.capsule)
+                .overlay {
+                    Text(ratio.formatted(.percent.precision(.fractionLength(0))))
+                        .font(.caption.weight(.semibold)).monospacedDigit()
+                        // Blanc avec liseré sombre : lisible sur la partie remplie comme sur le fond de la barre, en clair ou en sombre.
+                        .foregroundStyle(.white)
+                        .shadow(color: .black.opacity(0.7), radius: 1.5)
+                        .shadow(color: .black.opacity(0.5), radius: 0.5)
+                }
+                .animation(.linear(duration: 0.2), value: ratio)
+                .accessibilityLabel("Téléchargement")
+                .accessibilityValue(ratio.formatted(.percent.precision(.fractionLength(0))))
+        }
     }
 
     /// Démarre avec la dernière configuration connue du boîtier (réglable dans le volet Enregistrement).
@@ -413,10 +501,12 @@ private struct RecordButtonLabel: View {
 
 private struct RecordButtonStyle: ButtonStyle {
     let isRecording: Bool
+    /// Couleur imposée (ex. bouton de téléchargement) ; sinon rouge, ou gris foncé pendant l'enregistrement.
+    var tint: Color? = nil
     @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
-        let fill = isRecording ? Color(white: 0.22) : Color.red
+        let fill = tint ?? (isRecording ? Color(white: 0.22) : Color.red)
         configuration.label
             .font(.callout.weight(.semibold))
             .foregroundStyle(.white)
@@ -522,7 +612,8 @@ private struct SettingsPane: View {
                 Text("Connexion")
             } footer: {
                 Text("La connexion automatique choisit le premier boîtier dont le nom commence par « RaceBox » "
-                     + "pendant une recherche (au lancement ou via « Rechercher »). "
+                     + "pendant une recherche lancée avec « Rechercher » (ou au retour dans l'app sur iPhone / iPad) ; "
+                     + "rien ne démarre tout seul au lancement. "
                      + "Se déconnecter libère le boîtier pour un autre appareil ; un enregistrement autonome en cours continue.")
             }
         }
@@ -787,17 +878,6 @@ private struct RecordingTab: View {
     @State private var settings = RecordingSettings.aerobatics
     @State private var unlockCode = ""
     @State private var confirmErase = false
-    @State private var exportFile = ExportFile(text: "")
-    @State private var exportType = UTType.commaSeparatedText
-    @State private var exportName = "racebox"
-    @State private var showExporter = false
-
-    private func export(_ text: String, type: UTType, name: String) {
-        exportFile = ExportFile(text: text)
-        exportType = type
-        exportName = name
-        showExporter = true
-    }
 
     /// Lie un champ UInt16 des réglages à un Stepper entier.
     private func value(_ keyPath: WritableKeyPath<RecordingSettings, UInt16>) -> Binding<Int> {
@@ -876,9 +956,57 @@ private struct RecordingTab: View {
                 .disabled(link.isBusy)
             }
 
+            Section("Effacement") {
+                if let progress = link.eraseProgress {
+                    ProgressView(value: Double(progress), total: 100) {
+                        Text("Effacement : \(progress) %").font(.caption).monospacedDigit()
+                    }
+                    Button("Interrompre", role: .cancel) { Task { await link.cancelErase() } }
+                } else {
+                    Button("Effacer la mémoire…", role: .destructive) { confirmErase = true }
+                        .disabled(link.isBusy)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .confirmationDialog("Effacer toute la mémoire du boîtier ?", isPresented: $confirmErase) {
+            Button("Effacer", role: .destructive) { Task { await link.eraseMemory() } }
+        } message: {
+            Text("Les enregistrements non téléchargés seront perdus. L'opération peut durer quelques minutes.")
+        }
+        .onChange(of: link.recordingSettings) { _, new in
+            if let new { settings = new }
+        }
+        .task {
+            await link.readRecordingStatus()
+            await link.readRecordingSettings()
+        }
+    }
+}
+
+// MARK: - Volet Données
+
+/// Téléchargement de la mémoire du boîtier et export des sessions téléchargées.
+private struct DataTab: View {
+    let link: RaceBoxLink
+    @State private var exportFile = ExportFile(text: "")
+    @State private var exportType = UTType.commaSeparatedText
+    @State private var exportName = "racebox"
+    @State private var showExporter = false
+
+    private func export(_ text: String, type: UTType, name: String) {
+        exportFile = ExportFile(text: text)
+        exportType = type
+        exportName = name
+        showExporter = true
+    }
+
+    var body: some View {
+        Form {
             Section("Données enregistrées") {
                 HStack {
                     Button("Télécharger la mémoire") { Task { await link.downloadRecording() } }
+                        .disabled(link.state != .connected || !link.supportsRecording)
                     Spacer()
                     if link.isDownloading {
                         Button("Annuler", role: .cancel) { Task { await link.cancelDownload() } }
@@ -894,7 +1022,7 @@ private struct RecordingTab: View {
                     }
                 }
                 if !link.sessions.isEmpty {
-                    Text("Données gardées en mémoire dans l'app jusqu'à sa fermeture : exporte les sessions à conserver.")
+                    Text("Sessions téléchargées : archivées automatiquement (CSV et GPX) dans Documents/RaceBoxStudio.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 ForEach(link.sessions) { session in
@@ -916,35 +1044,11 @@ private struct RecordingTab: View {
                     }
                 }
             }
-
-            Section("Effacement") {
-                if let progress = link.eraseProgress {
-                    ProgressView(value: Double(progress), total: 100) {
-                        Text("Effacement : \(progress) %").font(.caption).monospacedDigit()
-                    }
-                    Button("Interrompre", role: .cancel) { Task { await link.cancelErase() } }
-                } else {
-                    Button("Effacer la mémoire…", role: .destructive) { confirmErase = true }
-                        .disabled(link.isBusy)
-                }
-            }
         }
         .formStyle(.grouped)
-        .confirmationDialog("Effacer toute la mémoire du boîtier ?", isPresented: $confirmErase) {
-            Button("Effacer", role: .destructive) { Task { await link.eraseMemory() } }
-        } message: {
-            Text("Les enregistrements non téléchargés seront perdus. L'opération peut durer quelques minutes.")
-        }
         .fileExporter(isPresented: $showExporter, document: exportFile, contentType: exportType,
                       defaultFilename: exportName) { result in
             if case .failure(let error) = result { link.errorMessage = error.localizedDescription }
-        }
-        .onChange(of: link.recordingSettings) { _, new in
-            if let new { settings = new }
-        }
-        .task {
-            await link.readRecordingStatus()
-            await link.readRecordingSettings()
         }
     }
 }

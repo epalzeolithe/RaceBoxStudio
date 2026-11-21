@@ -10,7 +10,7 @@
          <ExecutionAction
             ActionType = "Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction">
             <ActionContent
-               title = "Incrémenter le numéro de build"
+               title = "Incr&#xe9;menter le num&#xe9;ro de build"
                scriptText = "f=&quot;$PROJECT_DIR/RaceBoxStudio/BuildNumber.swift&quot;&#10;n=$(grep -o &apos;current = [0-9]*&apos; &quot;$f&quot; | grep -o &apos;[0-9]*$&apos;)&#10;sed -i &apos;&apos; &quot;s/current = [0-9]*/current = $((n + 1))/&quot; &quot;$f&quot;&#10;">
                <EnvironmentBuildable>
                   <BuildableReference
@@ -47,7 +47,7 @@
       shouldAutocreateTestPlan = "YES">
    </TestAction>
    <LaunchAction
-      buildConfiguration = "Debug"
+      buildConfiguration = "Release"
       selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       launchStyle = "0"

@@ -25,6 +25,12 @@ nonisolated struct TrackPoint: Identifiable, Sendable {
     var pitchRate = Double.nan
     var yawRate = Double.nan
     var satellites = Double.nan
+    /// Statut du fix GNSS (3 = 3D) et précisions annoncées par le récepteur (mètres, m/s, degrés).
+    var fix = Double.nan
+    var hAcc = Double.nan
+    var vAcc = Double.nan
+    var speedAcc = Double.nan
+    var headingAcc = Double.nan
 
     var hasPosition: Bool { latitude.isFinite && longitude.isFinite && !(latitude == 0 && longitude == 0) }
     var speedKmh: Double { speed * 3.6 }
@@ -270,6 +276,11 @@ nonisolated enum CSVReader {
         let ry = column("gyroydps", "gyroy", "rotationy", "roty")
         let rz = column("gyrozdps", "gyroz", "rotationz", "rotz")
         let sats = column("satellites", "sats", "numsv")
+        let fix = column("fix", "fixstatus")
+        let hAcc = column("haccuracym", "haccuracy", "hacc", "horizontalaccuracy")
+        let vAcc = column("vaccuracym", "vaccuracy", "vacc", "verticalaccuracy")
+        let sAcc = column("speedaccuracyms", "speedaccuracy", "sacc")
+        let headAcc = column("headingaccuracydeg", "headingaccuracy", "headacc")
 
         let dateStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
         func parseDate(_ text: Substring) -> Date? {
@@ -313,6 +324,11 @@ nonisolated enum CSVReader {
             p.pitchRate = value(ry)
             p.yawRate = value(rz)
             p.satellites = value(sats)
+            p.fix = value(fix)
+            p.hAcc = value(hAcc)
+            p.vAcc = value(vAcc)
+            p.speedAcc = value(sAcc)
+            p.headingAcc = value(headAcc)
             points.append(p)
         }
         return FlightTrack(name: name, startDate: startDate, points: points)
@@ -442,6 +458,11 @@ extension RecordingSession {
             p.pitchRate = s.rotationY
             p.yawRate = s.rotationZ
             p.satellites = Double(s.satellites)
+            p.fix = Double(s.fixStatus)
+            p.hAcc = s.horizontalAccuracy
+            p.vAcc = s.verticalAccuracy
+            p.speedAcc = s.speedAccuracy
+            p.headingAcc = s.headingAccuracy
             return p
         }
         return FlightTrack(name: title, startDate: startDate, points: points)

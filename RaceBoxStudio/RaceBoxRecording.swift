@@ -212,7 +212,9 @@ struct RecordingSession: Identifiable {
 
 struct ExportFile: FileDocument {
     nonisolated static var gpxType: UTType { UTType(filenameExtension: "gpx", conformingTo: .xml) ?? .xml }
-    nonisolated static var readableContentTypes: [UTType] { [.commaSeparatedText, gpxType, .xml] }
+    /// Export de la fusion GNSS / IMU : un CSV d'extension .fgpx.
+    nonisolated static var fgpxType: UTType { UTType(filenameExtension: "fgpx", conformingTo: .commaSeparatedText) ?? .commaSeparatedText }
+    nonisolated static var readableContentTypes: [UTType] { [.commaSeparatedText, gpxType, fgpxType, .xml] }
 
     var text: String
 
