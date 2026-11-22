@@ -444,7 +444,7 @@ extension RecordingSession {
         let firstItow = samples.first.map { Int64($0.itow) } ?? 0
         let points = samples.enumerated().map { index, s in
             var p = TrackPoint(id: index, time: Double(Int64(s.itow) - firstItow) / 1000)
-            if s.hasValidPosition {
+            if s.hasValidPosition || s.isFilled {
                 p.latitude = s.latitude
                 p.longitude = s.longitude
                 p.altitude = s.altitudeMSL

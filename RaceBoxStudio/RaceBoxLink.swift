@@ -350,14 +350,46 @@ final class RaceBoxLink: NSObject {
         }
     }
 
-    func startRecording(_ settings: RecordingSettings) async {
+    /// Change les réglages d'un enregistrement en cours (message « activé » renvoyé avec la nouvelle configuration).
+    /// Le protocole ignore le reste de la configuration quand « activé » = 0 : à l'arrêt il n'y a rien à appliquer,
+    /// seul « Démarrer » envoie les réglages. Chaque envoi peut créer une coupure d'environ 1,5 s dans les données.
+    /// La relecture dit ce que le boîtier a réellement retenu.
+    func applyRecordingSettings(_ settings: RecordingSettings) async {
+        await perform {
+            guard recordingStatus?.isRecording == true else {
+                addLog("Rien à appliquer : le boîtier ignore la configuration tant que l'enregistrement n'est pas démarré (utilise « Démarrer »).")
+                return
+            }
+            if settings.dataRate.needsFirmware33 { try requireFirmware() }
+            try await expectAck(id: UBX.RaceBoxID.recordingConfig, payload: settings.enablePayload,
+                                nackHint: "Mémoire verrouillée, ou boîtier non Mini S/Micro.")
+            addLog("Réglages envoyés à l'enregistrement en cours (coupure possible d'environ 1,5 s). Relecture…")
+            try await fetchRecordingSettings(log: false)
+            if recordingSettings == settings {
+                addLog("Réglages appliqués : \(settings.summary).")
+            } else {
+                addLog("⚠️ Le boîtier n'a pas retenu ces réglages : relu « \(recordingSettings?.summary ?? "?") ».")
+            }
+            try? await refreshRecordingStatus(log: false)
+        }
+    }
+
+    /// Envoie la configuration d'enregistrement (message 0xFF 0x25 : le boîtier la mémorise en l'activant).
+    /// `isUpdate` : l'enregistrement tourne déjà, on ne fait que changer ses réglages (filtre No-Fix, fréquence…).
+    func startRecording(_ settings: RecordingSettings, isUpdate: Bool = false) async {
         await perform {
             if settings.dataRate.needsFirmware33 { try requireFirmware() }
             try await expectAck(id: UBX.RaceBoxID.recordingConfig, payload: settings.enablePayload,
                                 nackHint: "Mémoire verrouillée, pleine, ou boîtier non Mini S/Micro.")
             recordingSettings = settings
             recordingState = .running
-            addLog("Enregistrement autonome démarré : \(settings.summary). Tu peux te déconnecter.")
+            if isUpdate {
+                addLog("Configuration appliquée à l'enregistrement en cours : \(settings.summary).")
+                // Relecture : confirme ce que le boîtier a réellement retenu.
+                try? await fetchRecordingSettings(log: true)
+            } else {
+                addLog("Enregistrement autonome démarré : \(settings.summary). Tu peux te déconnecter.")
+            }
             try? await refreshRecordingStatus()
         }
     }
@@ -490,8 +522,24 @@ final class RaceBoxLink: NSObject {
             downloadBuffer = []
             downloadBoundaries = []
             addLog("Téléchargement terminé : \(downloadedCount) échantillons, \(sessions.count) session(s).")
+            logPauses(sessions)
             archiveSessions(sessions)
         }
+    }
+
+    /// Résume les pauses (filtres No-Fix / immobilité du boîtier) trouvées dans les données et comblées.
+    private func logPauses(_ sessions: [RecordingSession]) {
+        let pauses = sessions.flatMap(\.pauses)
+        guard !pauses.isEmpty else { return }
+        func summary(_ kind: RecordingPause.Kind) -> String? {
+            let selected = pauses.filter { $0.kind == kind }
+            guard !selected.isEmpty else { return nil }
+            let total = selected.reduce(0) { $0 + $1.duration }
+            return "\(selected.count) pause(s) \(kind == .noFix ? "No-Fix" : "d'immobilité") (\(Int(total.rounded())) s)"
+        }
+        let added = pauses.reduce(0) { $0 + $1.filledCount }
+        addLog("Pauses détectées et comblées : " + [summary(.noFix), summary(.stationary)].compactMap { $0 }.joined(separator: ", ")
+               + " · \(added) échantillon(s) ajouté(s) (colonne « filled » du CSV).")
     }
 
     /// Archive les sessions (CSV + GPX) dans Documents/RaceBoxStudio, hors du fil principal.

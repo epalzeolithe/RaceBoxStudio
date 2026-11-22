@@ -300,6 +300,8 @@ private struct SidebarView: View {
 private struct RecordingStatusCard: View {
     let link: RaceBoxLink
 
+    @State private var confirmErase = false
+
     private enum Activity {
         case recording, paused, stopped, unknown
 
@@ -379,7 +381,7 @@ private struct RecordingStatusCard: View {
                     }
                     ProgressView(value: 1 - freeRatio)
                         .tint(memoryColor(freeRatio))
-                    Text("\(free.formatted()) / \(status.memorySize.formatted()) messages")
+                    Text("\(status.storedMessages.formatted()) / \(status.memorySize.formatted()) messages enregistrés")
                         .font(.caption2).foregroundStyle(.secondary)
                     Text("≈ \(durationText(status.remainingTime(hertz: hertz))) à \(hertz) Hz")
                         .font(.caption2).foregroundStyle(.secondary)
@@ -389,6 +391,7 @@ private struct RecordingStatusCard: View {
 
             recordingButton
             downloadButton
+            eraseButton
         }
         .padding(.vertical, 4)
     }
@@ -425,24 +428,39 @@ private struct RecordingStatusCard: View {
         if isDownloading {
             let expected = max(link.downloadExpected, 1)
             let ratio = Double(min(link.downloadedCount, expected)) / Double(expected)
-            // Barre de progression avec le pourcentage dessus.
-            ProgressView(value: ratio)
-                .progressViewStyle(.linear)
-                .tint(.accentColor)
-                .scaleEffect(x: 1, y: 3.2, anchor: .center)
-                .frame(height: 18)
-                .clipShape(.capsule)
-                .overlay {
-                    Text(ratio.formatted(.percent.precision(.fractionLength(0))))
-                        .font(.caption.weight(.semibold)).monospacedDigit()
-                        // Blanc avec liseré sombre : lisible sur la partie remplie comme sur le fond de la barre, en clair ou en sombre.
-                        .foregroundStyle(.white)
-                        .shadow(color: .black.opacity(0.7), radius: 1.5)
-                        .shadow(color: .black.opacity(0.5), radius: 0.5)
-                }
-                .animation(.linear(duration: 0.2), value: ratio)
-                .accessibilityLabel("Téléchargement")
-                .accessibilityValue(ratio.formatted(.percent.precision(.fractionLength(0))))
+            PercentBar(ratio: ratio, label: "Téléchargement")
+        }
+    }
+
+    /// Efface la mémoire du boîtier, après confirmation ; pendant l'effacement, devient « Interrompre » avec sa progression.
+    @ViewBuilder private var eraseButton: some View {
+        let progress = link.eraseProgress
+        Button {
+            if progress != nil {
+                Task { await link.cancelErase() }
+            } else {
+                confirmErase = true
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: progress != nil ? "xmark.circle" : "trash")
+                    .frame(width: 16, height: 16)
+                Text(progress != nil ? "Interrompre" : "Effacer")
+            }
+        }
+        .buttonStyle(RecordButtonStyle(isRecording: false, tint: .black))
+        .help(link.recordingStatus?.isRecording == true ? "Arrête l'enregistrement avant d'effacer la mémoire"
+                                                        : "Efface toute la mémoire du boîtier (confirmation demandée)")
+        .disabled(progress == nil && (!link.supportsRecording || link.isBusy || link.isDownloading
+                                      || link.recordingStatus?.isRecording == true))
+        .animation(.snappy, value: progress != nil)
+        .confirmationDialog("Effacer toute la mémoire du boîtier ?", isPresented: $confirmErase) {
+            Button("Effacer", role: .destructive) { Task { await link.eraseMemory() } }
+        } message: {
+            Text("Les enregistrements non téléchargés seront perdus. L'opération peut durer quelques minutes.")
+        }
+        if let progress {
+            PercentBar(ratio: Double(progress) / 100, label: "Effacement")
         }
     }
 
@@ -499,6 +517,31 @@ private struct RecordButtonLabel: View {
             Text(isRecording ? "Arrêter" : "Enregistrer")
                 .contentTransition(.interpolate)
         }
+    }
+}
+
+/// Barre de progression arrondie, pourcentage affiché dessus (blanc à liseré sombre : lisible sur tous les fonds).
+private struct PercentBar: View {
+    let ratio: Double
+    let label: String
+
+    var body: some View {
+        ProgressView(value: min(max(ratio, 0), 1))
+            .progressViewStyle(.linear)
+            .tint(.accentColor)
+            .scaleEffect(x: 1, y: 3.2, anchor: .center)
+            .frame(height: 18)
+            .clipShape(.capsule)
+            .overlay {
+                Text(ratio.formatted(.percent.precision(.fractionLength(0))))
+                    .font(.caption.weight(.semibold)).monospacedDigit()
+                    .foregroundStyle(.white)
+                    .shadow(color: .black.opacity(0.7), radius: 1.5)
+                    .shadow(color: .black.opacity(0.5), radius: 0.5)
+            }
+            .animation(.linear(duration: 0.2), value: ratio)
+            .accessibilityLabel(label)
+            .accessibilityValue(ratio.formatted(.percent.precision(.fractionLength(0))))
     }
 }
 
@@ -879,6 +922,7 @@ private struct LiveTab: View {
 private struct RecordingTab: View {
     let link: RaceBoxLink
     @State private var settings = RecordingSettings.aerobatics
+    private var isRecording: Bool { link.recordingStatus?.isRecording == true }
     @State private var unlockCode = ""
 
     /// Lie un champ UInt16 des réglages à un Stepper entier.
@@ -952,10 +996,17 @@ private struct RecordingTab: View {
                 HStack {
                     Button("Lire") { Task { await link.readRecordingSettings() } }
                     Spacer()
+                    Button("Appliquer") { Task { await link.applyRecordingSettings(settings) } }
+                        .disabled(!isRecording || settings == link.recordingSettings)
+                        .help("Envoie ces réglages à l'enregistrement en cours (coupure d'environ 1,5 s dans les données)")
                     Button("Démarrer") { Task { await link.startRecording(settings) } }
                     Button("Arrêter") { Task { await link.stopRecording() } }
                 }
                 .disabled(link.isBusy)
+                Text("Le boîtier ignore la configuration tant que l'enregistrement n'est pas activé : « Démarrer » l'envoie et lance "
+                     + "l'enregistrement. « Appliquer » (actif pendant un enregistrement, après modification d'un réglage) "
+                     + "change les réglages à chaud, avec une coupure d'environ 1,5 s dans les données.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
@@ -1018,6 +1069,11 @@ private struct DataTab: View {
                              + "vitesse max \(Int(session.maxSpeedKmh)) km/h · "
                              + String(format: "%.1f g max", session.maxG))
                             .font(.caption).foregroundStyle(.secondary)
+                        if !session.pauses.isEmpty {
+                            Text("\(session.pauses.count) pause(s) comblée(s) : "
+                                 + "\(session.pauses.reduce(0) { $0 + $1.filledCount }) échantillons ajoutés (No-Fix ou immobilité)")
+                                .font(.caption).foregroundStyle(.orange)
+                        }
                         HStack {
                             Button("Exporter CSV") {
                                 export(session.csv(), type: .commaSeparatedText, name: session.fileStem + ".csv")

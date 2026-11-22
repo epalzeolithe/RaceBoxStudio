@@ -34,6 +34,7 @@
         "compile-sources",
         "frameworks",
         "resources",
+        { "kind": "script", "name": "Numéro de build", "shell": "/bin/sh", "based-on-dependency-analysis": false, "script": "# Écrit le numéro de BuildNumber.swift (incrémenté par la pré-action du schéma) dans CFBundleVersion du produit.\nn=$(grep -o 'current = [0-9]*' \"$PROJECT_DIR/RaceBoxStudio/BuildNumber.swift\" | grep -o '[0-9]*$')\n[ -n \"$n\" ] || { echo \"error: numéro de build introuvable\"; exit 1; }\nplist=\"$TARGET_BUILD_DIR/$INFOPLIST_PATH\"\n/usr/libexec/PlistBuddy -c \"Set :CFBundleVersion $n\" \"$plist\" 2>/dev/null \\\n    || /usr/libexec/PlistBuddy -c \"Add :CFBundleVersion string $n\" \"$plist\"\n" },
       ],
       "build-settings": {
         "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
@@ -44,6 +45,7 @@
         "ENABLE_APP_SANDBOX": "NO",
         "ENABLE_PREVIEWS": "YES",
         "ENABLE_RESOURCE_ACCESS_BLUETOOTH": "YES",
+        "ENABLE_USER_SCRIPT_SANDBOXING": "NO",
         "ENABLE_USER_SELECTED_FILES": "readonly",
         "GENERATE_INFOPLIST_FILE": "YES",
         "INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription": "RaceBoxStudio se connecte en Bluetooth à votre RaceBox pour lire et modifier sa configuration.",
